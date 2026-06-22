@@ -1,4 +1,3 @@
-import queue
 import asyncio
 import json
 import os
@@ -10,7 +9,6 @@ import configparser
 import time
 import sqlite3
 import traceback
-from queue import Queue
 from typing import Dict, Optional, Set
 import concurrent.futures
 
