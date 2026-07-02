@@ -1,16 +1,19 @@
 import asyncio
+import base64
+import configparser
+import concurrent.futures
+import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
+import sqlite3
 import subprocess
 import sys
-import hashlib
-import configparser
 import time
-import sqlite3
 import traceback
-from typing import Dict, Optional, Set
-import concurrent.futures
+from typing import Any, Dict, Mapping, Optional, Set
 
 APP_VERSION = "1.0.1"
 
@@ -61,6 +64,8 @@ REFRESH_INTERVAL = 15
 CONNECT_TIMEOUT = 5
 HEARTBEAT_INTERVAL = 30
 SYNC_BATCH_SIZE = 50   # 每批同步消息数
+RELAY_PEERS = os.environ.get("EASYTIER_PEERS", "tcp://38.147.105.178:11010")
+LISTEN_HOST = os.environ.get("MAJESTICCHAT_BIND_HOST", "0.0.0.0")
 
 # ========== 路径 ==========
 def get_base_dir():
@@ -92,11 +97,11 @@ easytier_proc = None
 NETWORK_NAME = ""
 NETWORK_SECRET = ""
 
-def start_easytier():
+def start_easytier(network_name: str, network_secret: str, config_dir: str):
     global easytier_proc
     if not check_files():
         sys.exit(1)
-    if not NETWORK_NAME or not NETWORK_SECRET:
+    if not network_name or not network_secret:
         log_error("❌ 网络名或密码为空，请重新启动并输入")
         sys.exit(1)
     if sys.platform == "win32":
@@ -105,15 +110,13 @@ def start_easytier():
                            capture_output=True, encoding='utf-8', errors='ignore', timeout=2)
         except:
             pass
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    relay_ip = "38.147.105.178"
-    relay_port = "11010"
+    os.makedirs(config_dir, exist_ok=True)
     cmd = [
         CORE_EXE,
-        "--network-name", NETWORK_NAME,
-        "--network-secret", NETWORK_SECRET,
-        "--config-dir", CONFIG_DIR,
-        "--peers", f"tcp://{relay_ip}:{relay_port}",
+        "--network-name", network_name,
+        "--network-secret", network_secret,
+        "--config-dir", config_dir,
+        "--peers", RELAY_PEERS,
         "--use-smoltcp",
         "--dhcp"
     ]
@@ -207,10 +210,11 @@ def get_peer_ips() -> Set[str]:
 
 # ========== 聊天核心 ==========
 class ChatNode:
-    def __init__(self, username: str, self_ip: str, db_conn):
+    def __init__(self, username: str, self_ip: str, db_conn, network_secret: str):
         self.username = username
         self.self_ip = self_ip
         self.db_conn = db_conn
+        self.network_secret = network_secret or ""
         self.connections: Dict[str, asyncio.StreamWriter] = {}
         self.readers: Dict[str, asyncio.StreamReader] = {}
         self.peer_names: Dict[str, str] = {}
@@ -235,6 +239,9 @@ class ChatNode:
         
         # 心跳超时检测任务
         self.heartbeat_timeout_task: Optional[asyncio.Task] = None
+        self.session_keys: Dict[str, bytes] = {}
+        self.local_nonces: Dict[str, str] = {}
+        self.private_msg_counter = 0
 
         # 初始化 last_msg_id
         cursor = db_conn.execute('SELECT MAX(id) FROM messages')
@@ -253,10 +260,30 @@ class ChatNode:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(self.executor, self.db_conn.commit)
 
+    @staticmethod
+    def _as_str(value: object, default: str = "") -> str:
+        return value if isinstance(value, str) else default
+
+    @staticmethod
+    def _as_float(value: object, default: Optional[float] = None) -> Optional[float]:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+        return default
+
+    @staticmethod
+    def _as_int(value: object, default: int = 0) -> int:
+        if isinstance(value, bool):
+            return default
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value)
+        return default
+
     async def start_server(self):
         try:
             server = await asyncio.start_server(
-                self.handle_client, '0.0.0.0', PORT
+                self.handle_client, LISTEN_HOST, PORT
             )
             print(f"📡 聊天服务器已启动，监听端口 {PORT}")
             return server
@@ -276,7 +303,7 @@ class ChatNode:
             self.readers[ip] = reader
         print(f"🔗 新连接: {ip}")
         self.last_ping_time[ip] = time.time()
-        await self.send_handshake(writer)
+        await self.send_handshake(writer, ip)
         await asyncio.sleep(0.5)
         # 启动心跳并存储任务
         task = asyncio.create_task(self._heartbeat_sender(ip))
@@ -300,7 +327,7 @@ class ChatNode:
                 self.readers[ip] = reader
             print(f"🔗 主动连接 {ip} 成功")
             self.last_ping_time[ip] = time.time()
-            await self.send_handshake(writer)
+            await self.send_handshake(writer, ip)
             await asyncio.sleep(0.5)
             task = asyncio.create_task(self._heartbeat_sender(ip))
             self.heartbeat_tasks[ip] = task
@@ -335,9 +362,7 @@ class ChatNode:
                     break
                 writer = self.connections[ip]
             try:
-                msg = json.dumps({"type": "ping"})
-                writer.write((msg + "\n").encode('utf-8'))
-                await writer.drain()
+                await self._send_json(writer, {"type": "ping"}, ip)
                 self.last_ping_time[ip] = time.time()
             except Exception:
                 # 发送失败，断开
@@ -385,9 +410,74 @@ class ChatNode:
                 del self.last_ping_time[ip]
         print(f"🔌 连接断开: {ip}")
 
-    async def send_handshake(self, writer):
-        msg = json.dumps({"type": "handshake", "username": self.username})
-        writer.write((msg + "\n").encode('utf-8'))
+    def _derive_session_key(self, peer_nonce: str, local_nonce: str) -> bytes:
+        if not self.network_secret:
+            return b""
+        return hashlib.sha256(f"{self.network_secret}:{local_nonce}:{peer_nonce}".encode("utf-8")).digest()
+
+    def _wrap_payload(self, payload: Mapping[str, Any], peer_ip: str) -> Optional[Dict[str, Any]]:
+        if not self.network_secret:
+            return None
+        key = self.session_keys.get(peer_ip)
+        if not key:
+            return None
+        raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        nonce = secrets.token_hex(8)
+        masked = bytes(b ^ key[i % len(key)] for i, b in enumerate(raw))
+        mac = hmac.new(key, masked + nonce.encode("utf-8"), hashlib.sha256).hexdigest()
+        return {
+            "type": "secure",
+            "nonce": nonce,
+            "payload": base64.b64encode(masked).decode("ascii"),
+            "mac": mac,
+        }
+
+    def _unwrap_payload(self, msg: Mapping[str, Any], peer_ip: str) -> Optional[Dict[str, Any]]:
+        if not self.network_secret:
+            return None
+        key = self.session_keys.get(peer_ip)
+        if not key:
+            return None
+        payload_b64 = msg.get("payload")
+        nonce = msg.get("nonce")
+        mac = msg.get("mac")
+        if not isinstance(payload_b64, str) or not isinstance(nonce, str) or not isinstance(mac, str):
+            return None
+        try:
+            masked = base64.b64decode(payload_b64.encode("ascii"))
+        except Exception:
+            return None
+        expected_mac = hmac.new(key, masked + nonce.encode("utf-8"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected_mac, mac):
+            return None
+        raw = bytes(b ^ key[i % len(key)] for i, b in enumerate(masked))
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except Exception:
+            return None
+
+    async def _send_json(self, writer, payload: Mapping[str, Any], peer_ip: str):
+        wrapped = self._wrap_payload(payload, peer_ip)
+        if wrapped is not None:
+            writer.write((json.dumps(wrapped) + "\n").encode("utf-8"))
+        else:
+            writer.write((json.dumps(payload) + "\n").encode("utf-8"))
+        await writer.drain()
+
+    async def send_handshake(self, writer, peer_ip: str):
+        local_nonce = secrets.token_hex(8)
+        self.local_nonces[peer_ip] = local_nonce
+        payload = {
+            "type": "handshake",
+            "username": self.username,
+            "nonce": local_nonce,
+            "auth": hmac.new(
+                self.network_secret.encode("utf-8"),
+                f"{self.username}:{local_nonce}".encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest() if self.network_secret else "",
+        }
+        writer.write((json.dumps(payload) + "\n").encode('utf-8'))
         await writer.drain()
 
     async def send_sync_request(self, peer_ip: str):
@@ -401,8 +491,7 @@ class ChatNode:
             writer = self.connections[peer_ip]
         req = {"type": "sync_req", "last_msg_id": last_id}
         try:
-            writer.write((json.dumps(req) + "\n").encode('utf-8'))
-            await writer.drain()
+            await self._send_json(writer, req, peer_ip)
         except Exception as e:
             log_error(f"发送同步请求到 {peer_ip} 失败: {e}")
 
@@ -414,27 +503,37 @@ class ChatNode:
                     break
                 raw = data.decode('utf-8', errors='replace').strip()
                 try:
-                    msg = json.loads(raw)
-                    msg_type = msg.get("type")
+                    parsed = json.loads(raw)
+                    if not isinstance(parsed, dict):
+                        print(f"[错误] 无法解析JSON对象，原始数据: {raw[:100]}")
+                        continue
+                    msg: Dict[str, Any] = parsed
+                    if self._as_str(msg.get("type"), "") == "secure":
+                        unwrapped = self._unwrap_payload(msg, ip)
+                        if unwrapped is None:
+                            print(f"[警告] 收到无效的安全消息，来自 {ip}")
+                            await self._close_connection(ip)
+                            break
+                        msg = unwrapped
+                    msg_type = self._as_str(msg.get("type"), "")
                     if msg_type == "ping":
                         # 回应 pong
                         pong = json.dumps({"type": "pong"})
                         async with self.lock:
                             if ip in self.connections:
                                 writer = self.connections[ip]
-                                writer.write((pong + "\n").encode('utf-8'))
-                                await writer.drain()
+                                await self._send_json(writer, {"type": "pong"}, ip)
                     elif msg_type == "pong":
                         # 收到 pong，更新最后心跳时间
                         self.last_ping_time[ip] = time.time()
 
                     elif msg_type == "file_start":
-                        sender = msg.get("sender", "Unknown")
-                        filename = msg.get("filename", "unknown_file")
-                        total_size = msg.get("total_size", 0)
-                        total_chunks = msg.get("total_chunks", 0)
-                        transfer_id = msg.get("transfer_id", "")
-                        file_md5 = msg.get("md5", "")
+                        sender = self._as_str(msg.get("sender"), "Unknown")
+                        filename = self._as_str(msg.get("filename"), "unknown_file")
+                        total_size = self._as_int(msg.get("total_size"), 0)
+                        total_chunks = self._as_int(msg.get("total_chunks"), 0)
+                        transfer_id = self._as_str(msg.get("transfer_id"), "")
+                        file_md5 = self._as_str(msg.get("md5"), "")
                         if not transfer_id:
                             print(f"\n[系统] 文件传输缺少传输ID，已忽略")
                             return
@@ -469,8 +568,8 @@ class ChatNode:
                             self.file_receive_timeouts[key] = timeout_task
 
                     elif msg_type == "file_chunk":
-                        sender = msg.get("sender", "Unknown")
-                        transfer_id = msg.get("transfer_id", "")
+                        sender = self._as_str(msg.get("sender"), "Unknown")
+                        transfer_id = self._as_str(msg.get("transfer_id"), "")
                         if not transfer_id:
                             return
                         key = f"{ip}:{transfer_id}"
@@ -482,6 +581,8 @@ class ChatNode:
                         try:
                             import base64
                             data_b64 = msg.get("data")
+                            if not isinstance(data_b64, str):
+                                raise ValueError("缺少文件块数据")
                             chunk_data = base64.b64decode(data_b64)
                             context["file_handle"].write(chunk_data)
                             context["received"] += 1
@@ -525,8 +626,8 @@ class ChatNode:
                             print(f"\n[系统] 文件接收失败: {e}")
 
                     elif msg_type == "file_abort":
-                        sender = msg.get("sender", "Unknown")
-                        transfer_id = msg.get("transfer_id", "")
+                        sender = self._as_str(msg.get("sender"), "Unknown")
+                        transfer_id = self._as_str(msg.get("transfer_id"), "")
                         key = f"{ip}:{transfer_id}"
                         async with self.file_receive_lock:
                             if key in self.file_receive_contexts:
@@ -540,22 +641,34 @@ class ChatNode:
                     
                     
                     elif msg_type == "handshake":
-                        name = msg.get("username", "Unknown")
+                        name = self._as_str(msg.get("username"), "Unknown")
+                        peer_nonce = self._as_str(msg.get("nonce"), "")
+                        auth_value = self._as_str(msg.get("auth"), "")
+                        if self.network_secret and peer_nonce:
+                            expected_auth = hmac.new(
+                                self.network_secret.encode("utf-8"),
+                                f"{name}:{peer_nonce}".encode("utf-8"),
+                                hashlib.sha256,
+                            ).hexdigest()
+                            if not hmac.compare_digest(expected_auth, auth_value):
+                                print(f"[警告] 收到来自 {ip} 的无效握手，已拒绝")
+                                await self._close_connection(ip)
+                                break
+                        local_nonce = self.local_nonces.get(ip, "")
+                        if self.network_secret and peer_nonce and local_nonce:
+                            self.session_keys[ip] = self._derive_session_key(peer_nonce, local_nonce)
                         async with self.lock:
                             is_new = ip not in self.peer_names
-                            if is_new:
-                                self.peer_names[ip] = name
-                            else:
-                                self.peer_names[ip] = name
+                            self.peer_names[ip] = name
                         if is_new:
                             await self.broadcast_system(f"👋 {name} 加入了聊天室", exclude_ip=ip)
                             print(f"[系统] {name} 加入了聊天室")
                     elif msg_type == "chat":
-                        sender = msg.get("sender", "Unknown")
-                        content = msg.get("content", "")
-                        t = msg.get("time")
-                        msg_id = msg.get("msg_id")
-                        if t:
+                        sender = self._as_str(msg.get("sender"), "Unknown")
+                        content = self._as_str(msg.get("content"), "")
+                        t = self._as_float(msg.get("time"))
+                        msg_id = self._as_str(msg.get("msg_id"), "")
+                        if t is not None:
                             local_time = time.strftime("%H:%M:%S", time.localtime(t))
                             print(f"\n[{local_time}] {sender}: {content}")
                         else:
@@ -578,10 +691,10 @@ class ChatNode:
                             except Exception as e:
                                 log_error(f"保存聊天消息到数据库失败: {e}")
                     elif msg_type == "system":
-                        content = msg.get("content", "")
+                        content = self._as_str(msg.get("content"), "")
                         print(f"\n[系统] {content}")
                     elif msg_type == "sync_req":
-                        last_id = msg.get("last_msg_id", 0)
+                        last_id = self._as_int(msg.get("last_msg_id"), 0)
                         try:
                             # 分页查询，每批 SYNC_BATCH_SIZE 条
                             offset = 0
@@ -606,8 +719,7 @@ class ChatNode:
                                             return
                                         writer = self.connections[ip]
                                     try:
-                                        writer.write((json.dumps(sync_msg) + "\n").encode('utf-8'))
-                                        await writer.drain()
+                                        await self._send_json(writer, sync_msg, ip)
                                     except Exception as e:
                                         log_error(f"发送同步消息到 {ip} 失败: {e}")
                                         return
@@ -619,18 +731,17 @@ class ChatNode:
                                 if ip in self.connections:
                                     writer = self.connections[ip]
                                     try:
-                                        writer.write((json.dumps(end_msg) + "\n").encode('utf-8'))
-                                        await writer.drain()
+                                        await self._send_json(writer, end_msg, ip)
                                     except:
                                         pass
                         except Exception as e:
                             log_error(f"处理同步请求异常: {e}")
                     
                     elif msg_type == "private":
-                        sender = msg.get("sender", "Unknown")
-                        content = msg.get("content", "")
-                        t = msg.get("time")
-                        if t:
+                        sender = self._as_str(msg.get("sender"), "Unknown")
+                        content = self._as_str(msg.get("content"), "")
+                        t = self._as_float(msg.get("time"))
+                        if t is not None:
                             local_time = time.strftime("%H:%M:%S", time.localtime(t))
                             print(f"\n[{local_time}] [私聊] {sender}: {content}")
                         else:
@@ -646,10 +757,10 @@ class ChatNode:
                             log_error(f"保存私聊消息失败: {e}")
 
                     elif msg_type == "sync_msg":
-                        t = msg.get("time")
-                        sender = msg.get("sender", "Unknown")
-                        content = msg.get("content", "")
-                        msg_id = msg.get("msg_id")
+                        t = self._as_float(msg.get("time"))
+                        sender = self._as_str(msg.get("sender"), "Unknown")
+                        content = self._as_str(msg.get("content"), "")
+                        msg_id = self._as_str(msg.get("msg_id"), "")
                         if msg_id:
                             try:
                                 await self._execute_db(
@@ -702,17 +813,16 @@ class ChatNode:
             # 提取 ip 和 transfer_id
             ip, transfer_id = key.split(':', 1)
             # 尝试发送 file_abort
-            abort_msg = json.dumps({
+            abort_msg = {
                 "type": "file_abort",
                 "sender": self.username,
                 "transfer_id": transfer_id
-            })
+            }
             async with self.lock:
                 if ip in self.connections:
                     writer = self.connections[ip]
                     try:
-                        writer.write((abort_msg + "\n").encode('utf-8'))
-                        await writer.drain()
+                        await self._send_json(writer, abort_msg, ip)
                     except:
                         pass
             del self.file_receive_contexts[key]
@@ -737,35 +847,32 @@ class ChatNode:
                 del self.reconnect_tasks[ip]
 
     async def broadcast_system(self, content: str, exclude_ip: str | None = None):
-        msg = json.dumps({"type": "system", "content": content})
+        payload = {"type": "system", "content": content}
         async with self.lock:
-            for peer_ip, writer in list(self.connections.items()):
-                if peer_ip == exclude_ip:
-                    continue
-                try:
-                    writer.write((msg + "\n").encode('utf-8'))
-                    await writer.drain()
-                except Exception:
-                    pass
+            peers = [(peer_ip, writer) for peer_ip, writer in list(self.connections.items()) if peer_ip != exclude_ip]
+        for peer_ip, writer in peers:
+            try:
+                await self._send_json(writer, payload, peer_ip)
+            except Exception:
+                pass
         print(f"\n[系统] {content}")
 
     async def broadcast(self, content: str):
         t = time.time()
         msg_num = int(t * 1000)
         msg_id = f"{self.username}_{msg_num}"
-        msg = json.dumps({
+        msg = {
             "type": "chat",
             "sender": self.username,
             "content": content,
             "time": t,
-            "msg_id": msg_id
-        })
+            "msg_id": msg_id,
+        }
         async with self.lock:
-            writers = list(self.connections.values())
-        for writer in writers:
+            writers = list(self.connections.items())
+        for peer_ip, writer in writers:
             try:
-                writer.write((msg + "\n").encode('utf-8'))
-                await writer.drain()
+                await self._send_json(writer, msg, peer_ip)
             except Exception as e:
                 log_error(f"向 {writer.get_extra_info('peername')} 发送失败: {e}")
         # 保存自己消息
@@ -856,22 +963,21 @@ class ChatNode:
         file_md5 = md5.hexdigest()
 
         # 发送开始消息
-        start_msg = json.dumps({
+        start_msg = {
             "type": "file_start",
             "sender": self.username,
             "filename": filename,
             "total_size": file_size,
             "total_chunks": total_chunks,
             "transfer_id": transfer_id,
-            "md5": file_md5
-        })
+            "md5": file_md5,
+        }
         async with self.lock:
             if target_ip not in self.connections:
                 print(f"\n[系统] 目标连接已断开")
                 return
             writer = self.connections[target_ip]
-            writer.write((start_msg + "\n").encode('utf-8'))
-            await writer.drain()
+            await self._send_json(writer, start_msg, target_ip)
 
         # 分块发送
         sent = 0
@@ -889,21 +995,20 @@ class ChatNode:
                     break
                 import base64
                 encoded = base64.b64encode(chunk).decode('ascii')
-                chunk_msg = json.dumps({
+                chunk_msg = {
                     "type": "file_chunk",
                     "sender": self.username,
                     "transfer_id": transfer_id,
                     "index": i,
                     "total": total_chunks,
-                    "data": encoded
-                })
+                    "data": encoded,
+                }
                 async with self.lock:
                     if target_ip not in self.connections:
                         print(f"\n[系统] 传输中断: 目标断开")
                         return
                     writer = self.connections[target_ip]
-                    writer.write((chunk_msg + "\n").encode('utf-8'))
-                    await writer.drain()
+                    await self._send_json(writer, chunk_msg, target_ip)
                 sent += len(chunk)
                 progress = int((i+1) * 100 / total_chunks)
                 if progress >= last_progress + 10:
@@ -914,17 +1019,16 @@ class ChatNode:
 
     async def _send_abort(self, target_ip: str, transfer_id: str):
         """发送取消通知给接收端"""
-        abort_msg = json.dumps({
+        abort_msg = {
             "type": "file_abort",
             "sender": self.username,
-            "transfer_id": transfer_id
-        })
+            "transfer_id": transfer_id,
+        }
         async with self.lock:
             if target_ip in self.connections:
                 writer = self.connections[target_ip]
                 try:
-                    writer.write((abort_msg + "\n").encode('utf-8'))
-                    await writer.drain()
+                    await self._send_json(writer, abort_msg, target_ip)
                 except:
                     pass
 
@@ -978,27 +1082,28 @@ class ChatNode:
                 return
             # 构造私聊消息
             t = time.time()
-            msg = json.dumps({
+            self.private_msg_counter += 1
+            msg = {
                 "type": "private",
                 "sender": self.username,
                 "content": content,
-                "time": t
-            })
+                "time": t,
+                "msg_id": f"private_{self.username}_{int(t * 1000)}_{self.private_msg_counter}",
+            }
             async with self.lock:
                 if target_ip not in self.connections:
                     print(f"\n[系统] 用户 '{target_name}' 连接已断开")
                     return
                 writer = self.connections[target_ip]
                 try:
-                    writer.write((msg + "\n").encode('utf-8'))
-                    await writer.drain()
+                    await self._send_json(writer, msg, target_ip)
                     # 本地显示发送记录
                     local_time = time.strftime("%H:%M:%S", time.localtime(t))
                     print(f"\n[{local_time}] [私聊] 你 -> {target_name}: {content}")
                     # 保存到数据库
                     await self._execute_db(
                         'INSERT OR IGNORE INTO messages (time, sender, content, msg_id, type) VALUES (?, ?, ?, ?, ?)',
-                        (t, self.username, content, f"private_{int(t*1000)}", 'private')
+                        (t, self.username, content, msg['msg_id'], 'private')
                     )
                     await self._commit_db()
                 except Exception as e:
@@ -1102,7 +1207,6 @@ class ChatNode:
 async def main():
     global NETWORK_NAME, NETWORK_SECRET
 
-    check_terminal()
 
     if sys.platform == "win32":
         try:
@@ -1116,8 +1220,21 @@ async def main():
     config = configparser.ConfigParser()
     config_path = os.path.join(BASE_DIR, "config.ini")
     default_name = "MajesticChatServer"
-    default_secret = "202606211218"
+    default_secret = ""
     default_username = ""
+
+    def save_config(path: str, name: str, secret: str, user: str):
+        config['Chat'] = {
+            'network_name': name,
+            'network_secret': secret,
+            'username': user,
+        }
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                config.write(f)
+            print(f"✅ 配置已保存到 {path}")
+        except Exception as e:
+            log_error(f"保存配置文件失败: {e}")
 
     if os.path.exists(config_path):
         config.read(config_path, encoding='utf-8')
@@ -1125,10 +1242,13 @@ async def main():
             cfg_name = config['Chat'].get('network_name', '').strip()
             cfg_secret = config['Chat'].get('network_secret', '').strip()
             cfg_user = config['Chat'].get('username', '').strip()
-            if cfg_name and cfg_secret and cfg_user:
+            if cfg_name and cfg_user:
                 NETWORK_NAME = cfg_name
-                NETWORK_SECRET = cfg_secret
+                NETWORK_SECRET = cfg_secret or os.environ.get('MAJESTICCHAT_SECRET', '')
                 username = cfg_user
+                if not NETWORK_SECRET:
+                    NETWORK_SECRET = secrets.token_hex(8)
+                    save_config(config_path, NETWORK_NAME, NETWORK_SECRET, username)
                 print("\n" + "="*50)
                 print("          去中心化 P2P 聊天室")
                 print(f"版本: {APP_VERSION}")
@@ -1145,24 +1265,14 @@ async def main():
     NETWORK_NAME = input(f"请输入网络名称 (直接回车使用默认: {default_name}): ").strip()
     if not NETWORK_NAME:
         NETWORK_NAME = default_name
-    NETWORK_SECRET = input(f"请输入网络密码 (直接回车使用默认: {default_secret}): ").strip()
+    NETWORK_SECRET = input(f"请输入网络密码 (直接回车使用默认: 自动生成): ").strip()
     if not NETWORK_SECRET:
-        NETWORK_SECRET = default_secret
+        NETWORK_SECRET = secrets.token_hex(8)
     username = input(f"请输入你的昵称 (直接回车使用: {default_username or '匿名用户'}): ").strip()
     if not username:
         username = default_username or "匿名用户"
 
-    config['Chat'] = {
-        'network_name': NETWORK_NAME,
-        'network_secret': NETWORK_SECRET,
-        'username': username
-    }
-    try:
-        with open(config_path, 'w', encoding='utf-8') as f:
-            config.write(f)
-        print(f"✅ 配置已保存到 {config_path}")
-    except Exception as e:
-        log_error(f"保存配置文件失败: {e}")
+    save_config(config_path, NETWORK_NAME, NETWORK_SECRET, username)
 
     await start_networking_and_chat(username)
 
@@ -1170,7 +1280,7 @@ async def start_networking_and_chat(username: str):
     print(f"✅ 网络: {NETWORK_NAME}, 密码: {NETWORK_SECRET[:3]}***")
     print("正在启动组网服务...\n")
 
-    start_easytier()
+    start_easytier(NETWORK_NAME, NETWORK_SECRET, CONFIG_DIR)
 
     self_ip = None
     for attempt in range(15):
@@ -1206,7 +1316,7 @@ async def start_networking_and_chat(username: str):
     db_conn.execute('DELETE FROM messages WHERE time < ?', (cutoff,))
     db_conn.commit()
 
-    node = ChatNode(username, self_ip, db_conn)
+    node = ChatNode(username, self_ip, db_conn, NETWORK_SECRET)
 
     server = await node.start_server()
 
