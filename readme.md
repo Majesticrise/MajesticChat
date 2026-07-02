@@ -81,4 +81,4 @@ EasyTier 使用 Apache License 2.0 开源协议。
 ## 致谢
 EasyTier 提供了强大的 P2P 组网能力。
 
-所有参与测试与反馈的用户。
+参与测试的群友及Real Madrid
