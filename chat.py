@@ -241,6 +241,7 @@ class ChatNode:
         self.heartbeat_timeout_task: Optional[asyncio.Task] = None
         self.session_keys: Dict[str, bytes] = {}
         self.local_nonces: Dict[str, str] = {}
+        self.peer_nonces: Dict[str, str] = {}
         self.private_msg_counter = 0
 
         # 初始化 last_msg_id
@@ -413,7 +414,8 @@ class ChatNode:
     def _derive_session_key(self, peer_nonce: str, local_nonce: str) -> bytes:
         if not self.network_secret:
             return b""
-        return hashlib.sha256(f"{self.network_secret}:{local_nonce}:{peer_nonce}".encode("utf-8")).digest()
+        ordered_nonces = ":".join(sorted([local_nonce, peer_nonce]))
+        return hashlib.sha256(f"{self.network_secret}:{ordered_nonces}".encode("utf-8")).digest()
 
     def _wrap_payload(self, payload: Mapping[str, Any], peer_ip: str) -> Optional[Dict[str, Any]]:
         if not self.network_secret:
@@ -479,6 +481,9 @@ class ChatNode:
         }
         writer.write((json.dumps(payload) + "\n").encode('utf-8'))
         await writer.drain()
+        peer_nonce = self.peer_nonces.get(peer_ip)
+        if peer_nonce:
+            self.session_keys[peer_ip] = self._derive_session_key(peer_nonce, local_nonce)
 
     async def send_sync_request(self, peer_ip: str):
         """同步请求携带 last_msg_id"""
@@ -654,6 +659,8 @@ class ChatNode:
                                 print(f"[警告] 收到来自 {ip} 的无效握手，已拒绝")
                                 await self._close_connection(ip)
                                 break
+                        if peer_nonce:
+                            self.peer_nonces[ip] = peer_nonce
                         local_nonce = self.local_nonces.get(ip, "")
                         if self.network_secret and peer_nonce and local_nonce:
                             self.session_keys[ip] = self._derive_session_key(peer_nonce, local_nonce)
