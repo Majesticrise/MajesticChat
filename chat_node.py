@@ -15,25 +15,218 @@ from chat_config import BASE_DIR, HEARTBEAT_INTERVAL, LISTEN_HOST, PORT, CONNECT
 from easytier_utils import get_peer_ips
 
 
+class BaseGame:
+    def __init__(self, game_id, creator, players):
+        self.game_id = game_id
+        self.creator = creator
+        self.players = players
+        self.finished = False
+        self.winner = None
+
+    def handle_action(self, player, action_data):
+        """处理动作，返回 (success, message)"""
+        raise NotImplementedError
+
+    def get_state(self):
+        """返回当前游戏状态（用于显示或发送）"""
+        raise NotImplementedError
+
+    def is_finished(self):
+        return self.finished
+
+    def get_winner(self):
+        return self.winner
+
+    def get_participants(self):
+        return list(self.players)
+
+    @staticmethod
+    def _as_int(value, default=0):
+        if isinstance(value, bool):
+            return default
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value)
+        try:
+            return int(value)
+        except Exception:
+            return default
+
+class GomokuGame(BaseGame):
+    def __init__(self, game_id, creator, players):
+        super().__init__(game_id, creator, players)
+        self.board = [["" for _ in range(15)] for _ in range(15)]
+        self.current_player = creator
+        self.move_count = 0
+        self.symbols = {
+            players[0]: 'X',
+            players[1] if len(players) > 1 else creator: 'O'
+        }
+        self.player_order = [players[0]]
+        if len(players) > 1:
+            self.player_order.append(players[1])
+
+    def handle_action(self, player, action_data):
+        if self.finished:
+            return False, "游戏已结束"
+        if player != self.current_player:
+            return False, "当前不轮到你下棋"
+        if isinstance(action_data, str):
+            parts = action_data.strip().split()
+            if len(parts) != 3 or parts[0].lower() != 'move':
+                return False, "落子格式应为: move x y"
+            try:
+                x = int(parts[1])
+                y = int(parts[2])
+            except ValueError:
+                return False, "坐标必须为数字"
+        elif isinstance(action_data, dict):
+            x = self._as_int(action_data.get('x'), -1)
+            y = self._as_int(action_data.get('y'), -1)
+        else:
+            return False, "无效的动作数据"
+        if x < 1 or x > 15 or y < 1 or y > 15:
+            return False, "坐标必须在1到15之间"
+        board_x = x - 1
+        board_y = y - 1
+        if self.board[board_y][board_x] != "":
+            return False, "该位置已有棋子"
+        symbol = self.symbols.get(player, 'X')
+        self.board[board_y][board_x] = symbol
+        self.move_count += 1
+        if self._check_win(board_x, board_y):
+            self.finished = True
+            self.winner = player
+            return True, f"玩家 {player} 获胜！"
+        if len(self.player_order) == 2:
+            self.current_player = self.player_order[1] if self.current_player == self.player_order[0] else self.player_order[0]
+        return True, f"落子成功: ({x}, {y})，下一位: {self.current_player}"
+
+    def _check_win(self, x, y):
+        symbol = self.board[y][x]
+        if symbol == "":
+            return False
+        directions = [
+            (1, 0),
+            (0, 1),
+            (1, 1),
+            (1, -1),
+        ]
+        for dx, dy in directions:
+            count = 1
+            nx, ny = x + dx, y + dy
+            while 0 <= nx < 15 and 0 <= ny < 15 and self.board[ny][nx] == symbol:
+                count += 1
+                nx += dx
+                ny += dy
+            nx, ny = x - dx, y - dy
+            while 0 <= nx < 15 and 0 <= ny < 15 and self.board[ny][nx] == symbol:
+                count += 1
+                nx -= dx
+                ny -= dy
+            if count >= 5:
+                return True
+        return False
+
+    def get_state(self):
+        return {
+            "type": "gomoku",
+            "game_id": self.game_id,
+            "creator": self.creator,
+            "players": list(self.players),
+            "board": self.board,
+            "current_player": self.current_player,
+            "finished": self.finished,
+            "winner": self.winner,
+            "move_count": self.move_count,
+        }
+
+class GuessNumberGame(BaseGame):
+    def __init__(self, game_id, creator, players, range_low=1, range_high=100, max_attempts=10):
+        super().__init__(game_id, creator, players)
+        self.range_low = range_low
+        self.range_high = range_high
+        self.max_attempts = max_attempts
+        self.attempts = 0
+        self.guessed = set()
+        self.guess_history = []
+        self.secret_number = secrets.randbelow(range_high - range_low + 1) + range_low
+
+    def handle_action(self, player, action_data):
+        if self.finished:
+            return False, "游戏已结束"
+        if isinstance(action_data, str):
+            parts = action_data.strip().split()
+            if len(parts) != 2 or parts[0].lower() != 'guess':
+                return False, "猜数格式应为: guess n"
+            try:
+                guess = int(parts[1])
+            except ValueError:
+                return False, "猜测必须为数字"
+        elif isinstance(action_data, dict):
+            raw = action_data.get('guess')
+            if raw is None:
+                return False, "猜测必须为数字"
+            try:
+                guess = int(raw)
+            except Exception:
+                return False, "猜测必须为数字"
+        else:
+            return False, "无效的动作数据"
+        if guess < self.range_low or guess > self.range_high:
+            return False, f"猜测必须在 {self.range_low}-{self.range_high} 之间"
+        if guess in self.guessed:
+            return False, "该数字已被猜过"
+        self.guessed.add(guess)
+        self.guess_history.append({"player": player, "guess": guess})
+        self.attempts += 1
+        if guess == self.secret_number:
+            self.finished = True
+            self.winner = player
+            return True, f"恭喜 {player} 猜中了数字 {guess}，获胜！"
+        if self.attempts >= self.max_attempts:
+            self.finished = True
+            return True, f"次数用尽，游戏结束。正确答案是 {self.secret_number}。"
+        hint = "偏大" if guess > self.secret_number else "偏小"
+        return True, f"{player} 的猜测 {guess} {hint}，剩余次数 {self.max_attempts - self.attempts}"
+
+    def get_state(self):
+        return {
+            "type": "guess",
+            "game_id": self.game_id,
+            "creator": self.creator,
+            "players": list(self.players),
+            "range_low": self.range_low,
+            "range_high": self.range_high,
+            "max_attempts": self.max_attempts,
+            "attempts": self.attempts,
+            "guess_history": self.guess_history,
+            "finished": self.finished,
+            "winner": self.winner,
+        }
+
 class GameManager:
-    def __init__(self):
-        self.rooms = {}                 # 游戏名 -> 房间信息（含时间戳）
-        self.participants = {}          # 游戏名 -> 参与者用户名集合（Set）
-        self.cleanup_interval = 300     # 5分钟超时
+    def __init__(self, node):
+        self.node = node
+        self.rooms = {}
+        self.participants = {}
+        self.active_games = {}
+        self.game_records = {}
+        self.player_to_game = {}
+        self.game_counter = 0
+        self.cleanup_interval = 300
 
     def add_room(self, game_name, host_username, host_ip, port):
-        """创建房间，并自动将主机加入参与者集合"""
         self.rooms[game_name] = {
             'host_username': host_username,
             'host_ip': host_ip,
             'port': port,
             'timestamp': time.time()
         }
-        # 初始化参与者集合，将主机加入
         self.participants[game_name] = {host_username}
 
     def remove_room(self, game_name):
-        """删除房间及其参与者集合"""
         if game_name in self.rooms:
             del self.rooms[game_name]
         if game_name in self.participants:
@@ -43,7 +236,6 @@ class GameManager:
         return self.rooms.get(game_name)
 
     def list_rooms(self):
-        # 清理超时房间（同时清理参与者集合）
         now = time.time()
         expired = [name for name, info in self.rooms.items()
                    if now - info['timestamp'] > self.cleanup_interval]
@@ -52,14 +244,12 @@ class GameManager:
         return self.rooms.copy()
 
     def add_participant(self, game_name, username):
-        """将用户加入参与者集合（若房间存在）"""
         if game_name in self.participants:
             self.participants[game_name].add(username)
             return True
         return False
 
     def remove_participant(self, game_name, username):
-        """移除参与者，若移除后集合为空则自动删除房间"""
         if game_name not in self.participants:
             return False
         self.participants[game_name].discard(username)
@@ -69,10 +259,160 @@ class GameManager:
         return False
 
     def get_participants(self, game_name):
-        """获取参与者集合（副本）"""
         if game_name in self.participants:
             return self.participants[game_name].copy()
         return set()
+
+    def create_game(self, game_type, creator, *args):
+        self.game_counter += 1
+        game_id = f"g{self.game_counter}"
+        if game_type == 'gomoku':
+            opponent = args[0] if args and isinstance(args[0], str) else None
+            players = [creator]
+            if opponent and opponent != creator:
+                players.append(opponent)
+            game = GomokuGame(game_id, creator, players)
+        elif game_type == 'guess':
+            players = [creator]
+            range_low = 1
+            range_high = 100
+            max_attempts = 10
+            if args and isinstance(args[0], str):
+                spec = args[0].strip()
+                if '-' in spec:
+                    parts = spec.split('-', 1)
+                    try:
+                        range_low = int(parts[0])
+                        range_high = int(parts[1])
+                    except ValueError:
+                        pass
+            if args and len(args) > 1 and isinstance(args[1], int):
+                max_attempts = args[1]
+            game = GuessNumberGame(game_id, creator, players, range_low, range_high, max_attempts)
+        else:
+            raise ValueError("未知游戏类型")
+        self.active_games[game_id] = game
+        self.player_to_game[creator] = game_id
+        self.game_records[game_id] = {
+            'game_id': game_id,
+            'type': game_type,
+            'creator': creator,
+            'creator_ip': self.node.self_ip,
+            'participants': game.get_participants(),
+            'finished': False,
+        }
+        return game
+
+    def get_game(self, game_id):
+        return self.active_games.get(game_id)
+
+    def get_game_record(self, game_id):
+        return self.game_records.get(game_id)
+
+    def list_game_records(self):
+        return {gid: info.copy() for gid, info in self.game_records.items()}
+
+    def add_game_record(self, game_id, game_type, creator, creator_ip, participants, finished=False):
+        self.game_records[game_id] = {
+            'game_id': game_id,
+            'type': game_type,
+            'creator': creator,
+            'creator_ip': creator_ip,
+            'participants': list(participants) if isinstance(participants, (list, set, tuple)) else [],
+            'finished': bool(finished),
+        }
+
+    def update_game_record(self, game_id, **kwargs):
+        if game_id not in self.game_records:
+            return
+        for key, value in kwargs.items():
+            if key == 'participants' and isinstance(value, (list, set, tuple)):
+                self.game_records[game_id][key] = list(value)
+            elif key in self.game_records[game_id]:
+                self.game_records[game_id][key] = value
+
+    def add_game_participant(self, game_id, username):
+        if username in self.player_to_game and self.player_to_game[username] != game_id:
+            return False
+        game = self.get_game(game_id)
+        if game:
+            if isinstance(game, GomokuGame):
+                if username not in game.players:
+                    if len(game.players) >= 2:
+                        return False
+                    game.players.append(username)
+                    game.symbols[username] = 'O' if game.players[0] != username else 'X'
+                    if len(game.player_order) == 1:
+                        game.player_order.append(username)
+                self.player_to_game[username] = game_id
+                self.update_game_record(game_id, participants=game.get_participants())
+                return True
+            if username not in game.players:
+                game.players.append(username)
+            self.player_to_game[username] = game_id
+            self.update_game_record(game_id, participants=game.get_participants())
+            return True
+        record = self.get_game_record(game_id)
+        if record:
+            participants = record.get('participants', [])
+            if username in participants:
+                return True
+            if record.get('type') == 'gomoku' and len(participants) >= 2:
+                return False
+            participants.append(username)
+            self.update_game_record(game_id, participants=participants)
+            return True
+        return False
+
+    def remove_game_participant(self, game_id, username):
+        game = self.get_game(game_id)
+        if game:
+            if username in game.players:
+                game.players.remove(username)
+            if self.player_to_game.get(username) == game_id:
+                del self.player_to_game[username]
+            self.update_game_record(game_id, participants=game.get_participants())
+            if not game.players:
+                self.remove_game(game_id)
+                return True
+            return True
+        record = self.get_game_record(game_id)
+        if record:
+            participants = record.get('participants', [])
+            if username in participants:
+                participants.remove(username)
+                self.update_game_record(game_id, participants=participants)
+            return True
+        return False
+
+    def remove_game_record(self, game_id):
+        if game_id in self.game_records:
+            del self.game_records[game_id]
+
+    def remove_game(self, game_id):
+        game = self.active_games.pop(game_id, None)
+        if game:
+            for username in list(game.players):
+                if self.player_to_game.get(username) == game_id:
+                    del self.player_to_game[username]
+        self.remove_game_record(game_id)
+        return game
+
+    async def broadcast_game_state(self, game_id):
+        game = self.get_game(game_id)
+        if not game:
+            return
+        state = game.get_state()
+        message = {
+            'type': 'game_state',
+            'game_id': game_id,
+            'state': state,
+        }
+        participants = game.get_participants()
+        for username in participants:
+            if username == self.node.username:
+                continue
+            await self.node._send_to_username(username, message)
 
 class ChatNode:
     def __init__(self, username: str, self_ip: str, db_conn, network_secret: str):
@@ -110,7 +450,7 @@ class ChatNode:
             self.last_msg_id = row[0]
 
         self.heartbeat_timeout_task = asyncio.create_task(self._heartbeat_timeout_checker())
-        self.game_manager = GameManager()
+        self.game_manager = GameManager(self)
 
     async def _execute_db(self, sql, params=()):
         loop = asyncio.get_running_loop()
@@ -220,28 +560,22 @@ class ChatNode:
                 break
 
     async def _close_connection(self, ip: str):
-        async with self.file_receive_lock:
-            keys_to_delete = []
-            for key, ctx in list(self.file_receive_contexts.items()):
-                if key.startswith(f"{ip}:"):
-                    if ctx["file_handle"] and not ctx["file_handle"].closed:
-                        ctx["file_handle"].close()
-                    if os.path.exists(ctx["target_path"]):
-                        os.remove(ctx["target_path"])
-                    keys_to_delete.append(key)
-            for key in keys_to_delete:
-                del self.file_receive_contexts[key]
-                if key in self.file_receive_timeouts:
-                    task = self.file_receive_timeouts[key]
-                    if not task.done():
-                        task.cancel()
-                    del self.file_receive_timeouts[key]
+        # 清理该 IP 相关的未完成文件接收上下文
+        keys = [k for k in list(self.file_receive_contexts.keys()) if k.startswith(f"{ip}:")]
+        for key in keys:
+            await self._cleanup_file_receive(key)
         stop_msgs = []
+        game_over_msgs = []
         async with self.lock:
             host_rooms = [name for name, info in self.game_manager.rooms.items() if info['host_ip'] == ip]
             for name in host_rooms:
                 self.game_manager.remove_room(name)
                 stop_msgs.append({"type": "game_stop", "game_name": name})
+            # 如果断开的是某些内置游戏的创建者，结束那些游戏并广播 game_over
+            host_games = [gid for gid, rec in self.game_manager.game_records.items() if rec.get('creator_ip') == ip]
+            for gid in host_games:
+                self.game_manager.remove_game(gid)
+                game_over_msgs.append({'type': 'game_over', 'game_id': gid, 'winner': None})
             if ip in self.connections:
                 writer = self.connections[ip]
                 try:
@@ -268,9 +602,18 @@ class ChatNode:
                     await self._send_json(writer, stop_msg, peer_ip)
                 except Exception:
                     pass
+        for over_msg in game_over_msgs:
+            for peer_ip, writer in peers:
+                try:
+                    await self._send_json(writer, over_msg, peer_ip)
+                except Exception:
+                    pass
         if stop_msgs:
             for stop_msg in stop_msgs:
                 print(f"[游戏] 远程主机 {ip} 的游戏房间 {stop_msg['game_name']} 已结束")
+        if game_over_msgs:
+            for over_msg in game_over_msgs:
+                print(f"[游戏] 创建者 {ip} 中的内置游戏 {over_msg['game_id']} 已结束并移除")
         print(f"🔌 连接断开: {ip}")
 
     def _derive_session_key(self, peer_nonce: str, local_nonce: str) -> bytes:
@@ -327,6 +670,63 @@ class ChatNode:
         else:
             writer.write((json.dumps(payload) + "\n").encode("utf-8"))
         await writer.drain()
+
+    async def _send_to_username(self, username: str, payload: Mapping[str, Any]) -> bool:
+        target_ip = None
+        async with self.lock:
+            for ip, name in self.peer_names.items():
+                if name == username:
+                    target_ip = ip
+                    break
+        if not target_ip:
+            return False
+        async with self.lock:
+            writer = self.connections.get(target_ip)
+        if not writer:
+            return False
+        try:
+            await self._send_json(writer, payload, target_ip)
+            return True
+        except Exception:
+            return False
+
+    async def _send_to_participants(self, usernames, payload: Mapping[str, Any]):
+        for username in usernames:
+            if username == self.username:
+                continue
+            await self._send_to_username(username, payload)
+
+    def _format_game_state(self, state: dict) -> str:
+        try:
+            gtype = state.get('type')
+            if gtype == 'gomoku':
+                board = state.get('board', [])
+                lines = []
+                # header
+                header = '   ' + ' '.join(f"{i:2d}" for i in range(1, 16))
+                lines.append(header)
+                for y, row in enumerate(board, start=1):
+                    cells = ' '.join((c if c else '.') for c in row)
+                    lines.append(f"{y:2d} {cells}")
+                lines.append(f"当前回合: {state.get('current_player')}")
+                if state.get('finished'):
+                    lines.append(f"赢家: {state.get('winner')}")
+                return '\n'.join(lines)
+            elif gtype == 'guess':
+                parts = [f"范围: {state.get('range_low')}-{state.get('range_high')}",
+                         f"已猜次数: {state.get('attempts')}/{state.get('max_attempts')}"]
+                history = state.get('guess_history', [])
+                if history:
+                    parts.append("猜测记录:")
+                    for rec in history:
+                        parts.append(f"  {rec.get('player')}: {rec.get('guess')}")
+                if state.get('finished'):
+                    parts.append(f"赢家: {state.get('winner')}")
+                return '\n'.join(parts)
+            else:
+                return str(state)
+        except Exception:
+            return str(state)
 
     async def send_handshake(self, writer, peer_ip: str):
         local_nonce = secrets.token_hex(8)
@@ -464,31 +864,16 @@ class ChatNode:
                                         os.remove(context["target_path"])
                                 else:
                                     print(f"\n[系统] 文件 '{context['filename']}' 已接收完成，保存为 {context['target_path']}")
-                                async with self.file_receive_lock:
-                                    if key in self.file_receive_contexts:
-                                        del self.file_receive_contexts[key]
+                                await self._cleanup_file_receive(key)
                         except Exception as e:
                             log_error(f"接收文件块失败: {e}")
-                            if context["file_handle"] and not context["file_handle"].closed:
-                                context["file_handle"].close()
-                            if os.path.exists(context["target_path"]):
-                                os.remove(context["target_path"])
-                            async with self.file_receive_lock:
-                                if key in self.file_receive_contexts:
-                                    del self.file_receive_contexts[key]
+                            await self._cleanup_file_receive(key)
                             print(f"\n[系统] 文件接收失败: {e}")
                     elif msg_type == "file_abort":
                         sender = self._as_str(msg.get("sender"), "Unknown")
                         transfer_id = self._as_str(msg.get("transfer_id"), "")
                         key = f"{ip}:{transfer_id}"
-                        async with self.file_receive_lock:
-                            if key in self.file_receive_contexts:
-                                ctx = self.file_receive_contexts[key]
-                                if ctx["file_handle"] and not ctx["file_handle"].closed:
-                                    ctx["file_handle"].close()
-                                if os.path.exists(ctx["target_path"]):
-                                    os.remove(ctx["target_path"])
-                                del self.file_receive_contexts[key]
+                        await self._cleanup_file_receive(key)
                         print(f"\n[系统] 文件传输已取消（来自 {sender}）")
                     elif msg_type == "handshake":
                         name = self._as_str(msg.get("username"), "Unknown")
@@ -562,11 +947,68 @@ class ChatNode:
                                 if game_name and host_username and host_ip and port:
                                     self.game_manager.add_room(game_name, host_username, host_ip, port)
                             print(f"\n[游戏] 已同步 {len(rooms)} 个游戏房间")
-                    elif msg_type == "game_stop":
-                        game_name = self._as_str(msg.get("game_name"), "")
-                        if game_name:
-                            self.game_manager.remove_room(game_name)
-                            print(f"\n[游戏] 游戏房间 {game_name} 已结束")
+                    elif msg_type == "game_start":
+                        game_id = self._as_str(msg.get("game_id"), "")
+                        game_type = self._as_str(msg.get("game_type"), "")
+                        creator = self._as_str(msg.get("creator"), "")
+                        creator_ip = self._as_str(msg.get("creator_ip"), "")
+                        participants = msg.get("participants")
+                        if game_id and game_type and creator and creator_ip and isinstance(participants, list):
+                            self.game_manager.add_game_record(game_id, game_type, creator, creator_ip, participants)
+                            # 如果这个节点本身是创建者，记录本地 player->game 映射
+                            if creator == self.username:
+                                self.game_manager.player_to_game[creator] = game_id
+                            print(f"\n[游戏] 接收到新游戏 {game_id}({game_type})，创建者 {creator}，参与者 {', '.join(participants)}")
+                    elif msg_type == "game_join":
+                        game_id = self._as_str(msg.get("game_id"), "")
+                        username = self._as_str(msg.get("username"), "")
+                        if game_id and username:
+                            record = self.game_manager.get_game_record(game_id)
+                            if not record:
+                                print(f"\n[游戏] 收到加入通知，但未找到游戏记录 {game_id}")
+                                continue
+                            self.game_manager.add_game_participant(game_id, username)
+                            # 如果加入者是自己，确保本地映射存在
+                            if username == self.username:
+                                self.game_manager.player_to_game[username] = game_id
+                            print(f"\n[游戏] {username} 已加入游戏 {game_id}")
+                    elif msg_type == "game_action":
+                        game_id = self._as_str(msg.get("game_id"), "")
+                        actor = self._as_str(msg.get("actor"), "")
+                        action = self._as_str(msg.get("action"), "")
+                        if not game_id or not actor or not action:
+                            continue
+                        record = self.game_manager.get_game_record(game_id)
+                        if record and record.get('creator') == self.username:
+                            game = self.game_manager.get_game(game_id)
+                            if game:
+                                success, message = game.handle_action(actor, action)
+                                print(f"\n[游戏] 主机处理行动: {message}")
+                                await self.game_manager.broadcast_game_state(game_id)
+                                if game.is_finished():
+                                    winner = game.get_winner()
+                                    game_over = {
+                                        'type': 'game_over',
+                                        'game_id': game_id,
+                                        'winner': winner,
+                                    }
+                                    await self._send_to_participants(game.get_participants(), game_over)
+                                    self.game_manager.update_game_record(game_id, finished=True)
+                        else:
+                            print(f"\n[游戏] 收到行动 {actor}: {action} (仅主机处理)")
+                    elif msg_type == "game_state":
+                        game_id = self._as_str(msg.get("game_id"), "")
+                        state = msg.get("state")
+                        if game_id and isinstance(state, dict):
+                            self.game_manager.update_game_record(game_id, participants=state.get('players', []))
+                            summary = self._format_game_state(state)
+                            print(f"\n[游戏] 游戏 {game_id} 状态更新:\n{summary}")
+                    elif msg_type == "game_over":
+                        game_id = self._as_str(msg.get("game_id"), "")
+                        winner = self._as_str(msg.get("winner"), "")
+                        if game_id:
+                            self.game_manager.update_game_record(game_id, finished=True)
+                            print(f"\n[游戏] 游戏 {game_id} 已结束，赢家: {winner}")
                     elif msg_type == "sync_req":
                         last_id = self._as_int(msg.get("last_msg_id"), 0)
                         try:
@@ -689,6 +1131,35 @@ class ChatNode:
             if key in self.file_receive_timeouts:
                 del self.file_receive_timeouts[key]
             print(f"\n[系统] 文件接收超时 ({timeout_seconds}秒)，已取消")
+
+    async def _cleanup_file_receive(self, key: str):
+        """内部：清理指定文件接收上下文，安全可重入"""
+        async with self.file_receive_lock:
+            if key not in self.file_receive_contexts:
+                return
+            ctx = self.file_receive_contexts.get(key)
+            try:
+                if ctx and ctx.get("file_handle") and not ctx["file_handle"].closed:
+                    ctx["file_handle"].close()
+                if ctx and ctx.get("target_path") and os.path.exists(ctx["target_path"]):
+                    os.remove(ctx["target_path"])
+            except Exception:
+                pass
+            try:
+                del self.file_receive_contexts[key]
+            except Exception:
+                pass
+            if key in self.file_receive_timeouts:
+                task = self.file_receive_timeouts[key]
+                try:
+                    if not task.done():
+                        task.cancel()
+                except Exception:
+                    pass
+                try:
+                    del self.file_receive_timeouts[key]
+                except Exception:
+                    pass
 
     async def reconnect_peer(self, ip: str):
         backoff = 1
@@ -1032,6 +1503,143 @@ class ChatNode:
                 print(f"\n[系统] 你已加入游戏房间 {game_name}，主机 {room['host_username']} @ {room['host_ip']}:{room['port']}")
             else:
                 print(f"\n[系统] 无法加入游戏房间 '{game_name}'")
+        elif command == '/start_game':
+            if len(parts) < 2:
+                print("\n[系统] 用法: /start_game <gomoku|guess> [参数]")
+                return
+            game_type = parts[1].lower()
+            if self.username in self.game_manager.player_to_game:
+                print("\n[系统] 你已经参与了一个游戏，不能同时创建新游戏")
+                return
+            if game_type == 'gomoku':
+                opponent = parts[2] if len(parts) >= 3 else None
+                if opponent == self.username:
+                    opponent = None
+                if opponent and opponent not in self.peer_names.values():
+                    print(f"\n[系统] 玩家 {opponent} 不在线，创建的五子棋将等待对方加入")
+                    opponent = None
+                game = self.game_manager.create_game('gomoku', self.username, opponent)
+                self.game_manager.add_game_record(game.game_id, 'gomoku', self.username, self.self_ip, game.get_participants())
+                start_msg = {
+                    'type': 'game_start',
+                    'game_id': game.game_id,
+                    'game_type': 'gomoku',
+                    'creator': self.username,
+                    'creator_ip': self.self_ip,
+                    'participants': game.get_participants(),
+                }
+                await self._send_to_participants(game.get_participants(), start_msg)
+                print(f"\n[游戏] 已创建五子棋游戏 {game.game_id}，等待玩家加入")
+            elif game_type == 'guess':
+                spec = parts[2] if len(parts) >= 3 else '1-100'
+                game = self.game_manager.create_game('guess', self.username, spec)
+                self.game_manager.add_game_record(game.game_id, 'guess', self.username, self.self_ip, game.get_participants())
+                start_msg = {
+                    'type': 'game_start',
+                    'game_id': game.game_id,
+                    'game_type': 'guess',
+                    'creator': self.username,
+                    'creator_ip': self.self_ip,
+                    'participants': game.get_participants(),
+                }
+                await self._send_to_participants(game.get_participants(), start_msg)
+                if isinstance(game, GuessNumberGame):
+                    print(f"\n[游戏] 已创建猜数字游戏 {game.game_id}，范围 {game.range_low}-{game.range_high}，最多 {game.max_attempts} 次")
+                else:
+                    print(f"\n[游戏] 已创建猜数字游戏 {game.game_id}")
+            else:
+                print("\n[系统] 未知游戏类型，请使用 gomoku 或 guess")
+        elif command == '/join_game':
+            if len(parts) < 2:
+                print("\n[系统] 用法: /join_game <game_id>")
+                return
+            game_id = parts[1]
+            if self.username in self.game_manager.player_to_game:
+                print("\n[系统] 你已经参与了一个游戏，不能加入另一个游戏")
+                return
+            record = self.game_manager.get_game_record(game_id)
+            if not record:
+                print(f"\n[系统] 未找到游戏 {game_id}")
+                return
+            if record.get('finished'):
+                print(f"\n[系统] 游戏 {game_id} 已结束，无法加入")
+                return
+            if not self.game_manager.add_game_participant(game_id, self.username):
+                print(f"\n[系统] 无法加入游戏 {game_id}，该游戏可能已满或你已在其他游戏中")
+                return
+            join_msg = {
+                'type': 'game_join',
+                'game_id': game_id,
+                'username': self.username,
+            }
+            participants = record.get('participants', [])
+            await self._send_to_participants(participants, join_msg)
+            print(f"\n[游戏] 你已请求加入游戏 {game_id}")
+        elif command == '/game':
+            if len(parts) < 3:
+                print("\n[系统] 用法: /game <game_id> <动作>")
+                return
+            game_id = parts[1]
+            action = ' '.join(parts[2:])
+            record = self.game_manager.get_game_record(game_id)
+            if not record:
+                print(f"\n[系统] 未找到游戏 {game_id}")
+                return
+            creator = record.get('creator')
+            if self.username not in record.get('participants', []):
+                print(f"\n[系统] 你不在游戏 {game_id} 的参与者列表中")
+                return
+            action_msg = {
+                'type': 'game_action',
+                'game_id': game_id,
+                'actor': self.username,
+                'action': action,
+            }
+            await self._send_to_participants(record.get('participants', []), action_msg)
+            if creator == self.username:
+                game = self.game_manager.get_game(game_id)
+                if game:
+                    success, message = game.handle_action(self.username, action)
+                    print(f"\n[游戏] {message}")
+                    await self.game_manager.broadcast_game_state(game_id)
+                    if game.is_finished():
+                        winner = game.get_winner()
+                        game_over = {
+                            'type': 'game_over',
+                            'game_id': game_id,
+                            'winner': winner,
+                        }
+                        await self._send_to_participants(game.get_participants(), game_over)
+                        self.game_manager.update_game_record(game_id, finished=True)
+        elif command == '/list_games':
+            records = self.game_manager.list_game_records()
+            if not records:
+                print("\n[系统] 当前没有活跃小游戏")
+            else:
+                print("\n[系统] 当前活跃小游戏：")
+                for gid, info in records.items():
+                    status = '已结束' if info.get('finished') else '进行中'
+                    print(f"   {gid} - 类型: {info.get('type')}，创建者: {info.get('creator')}，参与者: {', '.join(info.get('participants', []))}，状态: {status}")
+        elif command == '/end_game':
+            if len(parts) < 2:
+                print("\n[系统] 用法: /end_game <game_id>")
+                return
+            game_id = parts[1]
+            record = self.game_manager.get_game_record(game_id)
+            if not record:
+                print(f"\n[系统] 未找到游戏 {game_id}")
+                return
+            if record.get('creator') != self.username:
+                print("\n[系统] 只有创建者可以结束游戏")
+                return
+            self.game_manager.remove_game(game_id)
+            over_msg = {
+                'type': 'game_over',
+                'game_id': game_id,
+                'winner': self.username,
+            }
+            await self._send_to_participants(record.get('participants', []), over_msg)
+            print(f"\n[游戏] 你已结束游戏 {game_id}")
         elif command == '/listgames':
             rooms = self.game_manager.list_rooms()
             if not rooms:
@@ -1090,6 +1698,11 @@ class ChatNode:
         elif command == '/help':
             print("\n[系统] 可用命令:")
             print("   /list 或 /who 查看在线用户")
+            print("   /start_game <gomoku|guess> [参数] 创建小游戏")
+            print("   /join_game <game_id> 加入小游戏")
+            print("   /game <game_id> <动作> 进行游戏动作")
+            print("   /list_games 列出当前所有小游戏")
+            print("   /end_game <game_id> 结束你创建的小游戏")
             print("   /history 查看最近聊天记录（包含私聊）")
             print("   /msg <昵称> <消息> 发送私聊")
             print("   /send <昵称> <文件路径> 发送文件")

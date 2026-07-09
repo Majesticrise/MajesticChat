@@ -1,0 +1,55 @@
+name: Build and Release MajesticChat
+
+on:
+  push:
+    tags:
+      - 'v*'  # 推送 v1.0.0 等标签时触发
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      # 1. 拉取代码（包含 easytier-core.exe 和 easytier-cli.exe）
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 2. 设置 Python 环境
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # 3. 安装 PyInstaller（无 requirements.txt，直接安装）
+      - name: Install PyInstaller
+        run: |
+          pip install pyinstaller
+
+      # 4. 执行打包命令（使用你的参数，并加入额外隐藏导入和数据文件）
+      - name: Build EXE with PyInstaller
+        run: |
+          pyinstaller -D -n MajesticChat `
+            --uac-admin `
+            --console `
+            --hidden-import=sqlite3 `
+            --hidden-import=chat_config `
+            --hidden-import=chat_node `
+            --hidden-import=easytier_utils `
+            --hidden-import=chat_main `
+            --add-data "easytier-core.exe;." `
+            --add-data "easytier-cli.exe;." `
+            chat_main.py
+
+      # 5. 将生成的文件夹压缩为 ZIP（便于发布）
+      - name: Compress build folder
+        run: |
+          Compress-Archive -Path dist/MajesticChat/* -DestinationPath MajesticChat.zip
+
+      # 6. 发布到 Releases
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: MajesticChat.zip
