@@ -6,15 +6,73 @@ import hmac
 import json
 import os
 import secrets
-import sqlite3
 import sys
 import time
 import traceback
-from typing import Any, Dict, Mapping, Optional, Set
+from typing import Any, Dict, Mapping, Optional
 
 from chat_config import BASE_DIR, HEARTBEAT_INTERVAL, LISTEN_HOST, PORT, CONNECT_TIMEOUT, REFRESH_INTERVAL, SYNC_BATCH_SIZE, log_error
 from easytier_utils import get_peer_ips
 
+
+class GameManager:
+    def __init__(self):
+        self.rooms = {}                 # 游戏名 -> 房间信息（含时间戳）
+        self.participants = {}          # 游戏名 -> 参与者用户名集合（Set）
+        self.cleanup_interval = 300     # 5分钟超时
+
+    def add_room(self, game_name, host_username, host_ip, port):
+        """创建房间，并自动将主机加入参与者集合"""
+        self.rooms[game_name] = {
+            'host_username': host_username,
+            'host_ip': host_ip,
+            'port': port,
+            'timestamp': time.time()
+        }
+        # 初始化参与者集合，将主机加入
+        self.participants[game_name] = {host_username}
+
+    def remove_room(self, game_name):
+        """删除房间及其参与者集合"""
+        if game_name in self.rooms:
+            del self.rooms[game_name]
+        if game_name in self.participants:
+            del self.participants[game_name]
+
+    def get_room(self, game_name):
+        return self.rooms.get(game_name)
+
+    def list_rooms(self):
+        # 清理超时房间（同时清理参与者集合）
+        now = time.time()
+        expired = [name for name, info in self.rooms.items()
+                   if now - info['timestamp'] > self.cleanup_interval]
+        for name in expired:
+            self.remove_room(name)
+        return self.rooms.copy()
+
+    def add_participant(self, game_name, username):
+        """将用户加入参与者集合（若房间存在）"""
+        if game_name in self.participants:
+            self.participants[game_name].add(username)
+            return True
+        return False
+
+    def remove_participant(self, game_name, username):
+        """移除参与者，若移除后集合为空则自动删除房间"""
+        if game_name not in self.participants:
+            return False
+        self.participants[game_name].discard(username)
+        if not self.participants[game_name]:
+            self.remove_room(game_name)
+            return True
+        return False
+
+    def get_participants(self, game_name):
+        """获取参与者集合（副本）"""
+        if game_name in self.participants:
+            return self.participants[game_name].copy()
+        return set()
 
 class ChatNode:
     def __init__(self, username: str, self_ip: str, db_conn, network_secret: str):
@@ -52,6 +110,7 @@ class ChatNode:
             self.last_msg_id = row[0]
 
         self.heartbeat_timeout_task = asyncio.create_task(self._heartbeat_timeout_checker())
+        self.game_manager = GameManager()
 
     async def _execute_db(self, sql, params=()):
         loop = asyncio.get_running_loop()
@@ -128,11 +187,10 @@ class ChatNode:
             self.heartbeat_tasks[ip] = task
             asyncio.create_task(self.send_sync_request(ip))
             asyncio.create_task(self.receive_messages(reader, ip))
-        except asyncio.TimeoutError:
-            pass
+        except asyncio.TimeoutError as e:
+            log_error(f"连接 {ip} 超时: {e}")
         except Exception as e:
-            with open(os.path.join(BASE_DIR, "error.log"), "a", encoding="utf-8") as f:
-                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 连接 {ip} 失败: {e}\n")
+            log_error(f"连接 {ip} 失败: {e}")
 
     async def _heartbeat_timeout_checker(self):
         while self.running:
@@ -178,7 +236,12 @@ class ChatNode:
                     if not task.done():
                         task.cancel()
                     del self.file_receive_timeouts[key]
+        stop_msgs = []
         async with self.lock:
+            host_rooms = [name for name, info in self.game_manager.rooms.items() if info['host_ip'] == ip]
+            for name in host_rooms:
+                self.game_manager.remove_room(name)
+                stop_msgs.append({"type": "game_stop", "game_name": name})
             if ip in self.connections:
                 writer = self.connections[ip]
                 try:
@@ -198,6 +261,16 @@ class ChatNode:
                 del self.heartbeat_tasks[ip]
             if ip in self.last_ping_time:
                 del self.last_ping_time[ip]
+            peers = list(self.connections.items())
+        for stop_msg in stop_msgs:
+            for peer_ip, writer in peers:
+                try:
+                    await self._send_json(writer, stop_msg, peer_ip)
+                except Exception:
+                    pass
+        if stop_msgs:
+            for stop_msg in stop_msgs:
+                print(f"[游戏] 远程主机 {ip} 的游戏房间 {stop_msg['game_name']} 已结束")
         print(f"🔌 连接断开: {ip}")
 
     def _derive_session_key(self, peer_nonce: str, local_nonce: str) -> bytes:
@@ -270,9 +343,10 @@ class ChatNode:
         }
         writer.write((json.dumps(payload) + "\n").encode('utf-8'))
         await writer.drain()
-        peer_nonce = self.peer_nonces.get(peer_ip)
-        if peer_nonce:
-            self.session_keys[peer_ip] = self._derive_session_key(peer_nonce, local_nonce)
+        rooms = self.game_manager.list_rooms()
+        if rooms:
+            room_msg = {"type": "game_list", "rooms": rooms}
+            await self._send_json(writer, room_msg, peer_ip)
 
     async def send_sync_request(self, peer_ip: str):
         print(f"[系统] 正在与 {peer_ip} 同步历史消息...")
@@ -310,7 +384,9 @@ class ChatNode:
                         msg = unwrapped
                     msg_type = self._as_str(msg.get("type"), "")
                     if msg_type == "ping":
-                        await self._send_json(self.connections[ip], {"type": "pong"}, ip)
+                        async with self.lock:
+                            if ip in self.connections:
+                                await self._send_json(self.connections[ip], {"type": "pong"}, ip)
                     elif msg_type == "pong":
                         self.last_ping_time[ip] = time.time()
                     elif msg_type == "file_start":
@@ -468,6 +544,29 @@ class ChatNode:
                     elif msg_type == "system":
                         content = self._as_str(msg.get("content"), "")
                         print(f"\n[系统] {content}")
+                    elif msg_type == "game_host":
+                        game_name = self._as_str(msg.get("game_name"), "")
+                        host_username = self._as_str(msg.get("host_username"), "")
+                        host_ip = self._as_str(msg.get("host_ip"), "")
+                        port = self._as_int(msg.get("port"), 0)
+                        if game_name and host_username and host_ip and port:
+                            self.game_manager.add_room(game_name, host_username, host_ip, port)
+                            print(f"\n[游戏] 已同步游戏房间 {game_name}，主机 {host_username} @ {host_ip}:{port}")
+                    elif msg_type == "game_list":
+                        rooms = msg.get("rooms")
+                        if isinstance(rooms, dict):
+                            for game_name, info in rooms.items():
+                                host_username = self._as_str(info.get("host_username"), "")
+                                host_ip = self._as_str(info.get("host_ip"), "")
+                                port = self._as_int(info.get("port"), 0)
+                                if game_name and host_username and host_ip and port:
+                                    self.game_manager.add_room(game_name, host_username, host_ip, port)
+                            print(f"\n[游戏] 已同步 {len(rooms)} 个游戏房间")
+                    elif msg_type == "game_stop":
+                        game_name = self._as_str(msg.get("game_name"), "")
+                        if game_name:
+                            self.game_manager.remove_room(game_name)
+                            print(f"\n[游戏] 游戏房间 {game_name} 已结束")
                     elif msg_type == "sync_req":
                         last_id = self._as_int(msg.get("last_msg_id"), 0)
                         try:
@@ -888,6 +987,106 @@ class ChatNode:
                 print("\n[系统] 已取消所有文件传输")
             else:
                 await self._cancel_send(target)
+        elif command == '/host':
+            if len(parts) < 2:
+                print("\n[系统] 用法: /host <游戏名> [端口]")
+                return
+            game_name = parts[1]
+            port = 25565
+            if len(parts) >= 3:
+                try:
+                    port = int(parts[2])
+                except ValueError:
+                    print("\n[系统] 端口必须为数字")
+                    return
+            if self.game_manager.get_room(game_name):
+                print(f"\n[系统] 游戏房间 '{game_name}' 已存在")
+                return
+            self.game_manager.add_room(game_name, self.username, self.self_ip, port)
+            print(f"\n[系统] 你已创建游戏房间 {game_name}，地址 {self.self_ip}:{port}")
+            await self.broadcast_system(f"[游戏] {self.username} 已创建游戏房间 {game_name}，地址 {self.self_ip}:{port}")
+            host_msg = {
+                "type": "game_host",
+                "game_name": game_name,
+                "host_username": self.username,
+                "host_ip": self.self_ip,
+                "port": port,
+            }
+            async with self.lock:
+                peers = list(self.connections.items())
+            for peer_ip, writer in peers:
+                try:
+                    await self._send_json(writer, host_msg, peer_ip)
+                except Exception:
+                    pass
+        elif command == '/join':
+            if len(parts) < 2:
+                print("\n[系统] 用法: /join <游戏名>")
+                return
+            game_name = parts[1]
+            room = self.game_manager.get_room(game_name)
+            if not room:
+                print(f"\n[系统] 未找到游戏房间 '{game_name}'")
+                return
+            if self.game_manager.add_participant(game_name, self.username):
+                print(f"\n[系统] 你已加入游戏房间 {game_name}，主机 {room['host_username']} @ {room['host_ip']}:{room['port']}")
+            else:
+                print(f"\n[系统] 无法加入游戏房间 '{game_name}'")
+        elif command == '/listgames':
+            rooms = self.game_manager.list_rooms()
+            if not rooms:
+                print("\n[系统] 当前没有活动游戏房间")
+            else:
+                print("\n[系统] 当前活动游戏房间：")
+                for name, info in rooms.items():
+                    count = len(self.game_manager.get_participants(name))
+                    print(f"   {name} - 主机: {info['host_username']} @ {info['host_ip']}:{info['port']}，参与者: {count}")
+        elif command == '/stopgame':
+            if len(parts) < 2:
+                print("\n[系统] 用法: /stopgame <游戏名>")
+                return
+            game_name = parts[1]
+            room = self.game_manager.get_room(game_name)
+            if not room:
+                print(f"\n[系统] 未找到游戏房间 '{game_name}'")
+                return
+            if room['host_username'] != self.username:
+                print("\n[系统] 只有房主才能结束游戏房间")
+                return
+            self.game_manager.remove_room(game_name)
+            print(f"\n[系统] 你已结束游戏房间 {game_name}")
+            await self.broadcast_system(f"[游戏] {self.username} 结束了 {game_name} 房间")
+            stop_msg = {"type": "game_stop", "game_name": game_name}
+            async with self.lock:
+                peers = list(self.connections.items())
+            for peer_ip, writer in peers:
+                try:
+                    await self._send_json(writer, stop_msg, peer_ip)
+                except Exception:
+                    pass
+        elif command == '/leave':
+            if len(parts) < 2:
+                print("\n[系统] 用法: /leave <游戏名>")
+                return
+            game_name = parts[1]
+            if not self.game_manager.get_room(game_name):
+                print(f"\n[系统] 未找到游戏房间 '{game_name}'")
+                return
+            emptied = self.game_manager.remove_participant(game_name, self.username)
+            if emptied:
+                print(f"\n[系统] 你已退出游戏房间 {game_name}，房间已空并关闭")
+                await self.broadcast_system(f"[游戏] {self.username} 退出了 {game_name} 房间（房间已空）")
+                stop_msg = {"type": "game_stop", "game_name": game_name}
+                async with self.lock:
+                    peers = list(self.connections.items())
+                for peer_ip, writer in peers:
+                    try:
+                        await self._send_json(writer, stop_msg, peer_ip)
+                    except Exception:
+                        pass
+            else:
+                print(f"\n[系统] 你已退出游戏房间 {game_name}")
+                await self.broadcast_system(f"[游戏] {self.username} 退出了 {game_name} 房间")
         elif command == '/help':
             print("\n[系统] 可用命令:")
             print("   /list 或 /who 查看在线用户")
@@ -895,6 +1094,11 @@ class ChatNode:
             print("   /msg <昵称> <消息> 发送私聊")
             print("   /send <昵称> <文件路径> 发送文件")
             print("   /cancel <传输ID> 或 /cancel all 取消文件传输")
+            print("   /host <游戏名> [端口] 创建游戏房间（你自动成为主机）")
+            print("   /join <游戏名> 加入游戏房间（你成为参与者）")
+            print("   /leave <游戏名> 退出你加入的游戏房间")
+            print("   /listgames 列出所有活动房间")
+            print("   /stopgame <游戏名> 结束你作为主机的游戏")
         else:
             print(f"\n[系统] 未知命令: {command}，输入 /help 查看帮助")
 
