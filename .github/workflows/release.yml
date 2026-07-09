@@ -2,8 +2,8 @@ name: Build and Release MajesticChat
 
 on:
   push:
-    tags:
-      - 'v*'  # 推送 v1.0.0 等标签时触发
+    branches:
+      - main
 
 permissions:
   contents: write
