@@ -681,18 +681,18 @@ class ChatNode:
         await writer.drain()
 
     async def _send_to_username(self, username: str, payload: Mapping[str, Any]) -> bool:
-        target_ip = None
+        # 一次性在锁内读取目标 IP 与 writer，避免竞态条件
         async with self.lock:
+            target_ip = None
             for ip, name in self.peer_names.items():
                 if name == username:
                     target_ip = ip
                     break
-        if not target_ip:
-            return False
-        async with self.lock:
+            if not target_ip:
+                return False
             writer = self.connections.get(target_ip)
-        if not writer:
-            return False
+            if not writer:
+                return False
         try:
             await self._send_json(writer, payload, target_ip)
             return True
@@ -722,8 +722,18 @@ class ChatNode:
                     lines.append(f"赢家: {state.get('winner')}")
                 return '\n'.join(lines)
             elif gtype == 'guess':
-                parts = [f"范围: {state.get('range_low')}-{state.get('range_high')}",
-                         f"已猜次数: {state.get('attempts')}/{state.get('max_attempts')}"]
+                parts = [f"范围: {state.get('range_low')}-{state.get('range_high')}"]
+                attempts = state.get('attempts')
+                max_attempts = state.get('max_attempts')
+                # attempts 可能是字典（每玩家）或整型（兼容旧版）
+                if isinstance(attempts, dict):
+                    parts.append("尝试次数（每人）:")
+                    for p in state.get('players', []):
+                        used = attempts.get(p, 0)
+                        remaining = max_attempts - used if isinstance(max_attempts, int) else '?'
+                        parts.append(f"  {p}: {used}/{max_attempts} (剩余 {remaining})")
+                else:
+                    parts.append(f"已猜次数: {attempts}/{max_attempts}")
                 history = state.get('guess_history', [])
                 if history:
                     parts.append("猜测记录:")
@@ -1604,23 +1614,28 @@ class ChatNode:
                 'actor': self.username,
                 'action': action,
             }
-            await self._send_to_participants(record.get('participants', []), action_msg)
-            if creator == self.username:
-                game = self.game_manager.get_game(game_id)
-                if game:
-                    success, message = game.handle_action(self.username, action)
-                    print(f"\n[游戏] {message}")
-                    await self.game_manager.broadcast_game_state(game_id)
-                    if game.is_finished():
-                        winner = game.get_winner()
-                        game_over = {
-                            'type': 'game_over',
-                            'game_id': game_id,
-                            'winner': winner,
-                        }
-                        await self._send_to_participants(game.get_participants(), game_over)
-                        self.game_manager.update_game_record(game_id, finished=True)
-        elif command == '/list_games':
+            # 仅发送动作给主机（创建者），非主机不再广播此动作给其他非主机
+            if creator != self.username:
+                sent = await self._send_to_username(creator, action_msg)
+                if not sent:
+                    print("\n[系统] 无法将行动发送给主机，可能已断开")
+                return
+            # 如果当前节点是主机，则本地处理动作并广播状态
+            game = self.game_manager.get_game(game_id)
+            if game:
+                success, message = game.handle_action(self.username, action)
+                print(f"\n[游戏] {message}")
+                await self.game_manager.broadcast_game_state(game_id)
+                if game.is_finished():
+                    winner = game.get_winner()
+                    game_over = {
+                        'type': 'game_over',
+                        'game_id': game_id,
+                        'winner': winner,
+                    }
+                    await self._send_to_participants(game.get_participants(), game_over)
+                    self.game_manager.update_game_record(game_id, finished=True)
+        elif command == '/games':
             records = self.game_manager.list_game_records()
             if not records:
                 print("\n[系统] 当前没有活跃小游戏")
@@ -1649,7 +1664,7 @@ class ChatNode:
             }
             await self._send_to_participants(record.get('participants', []), over_msg)
             print(f"\n[游戏] 你已结束游戏 {game_id}")
-        elif command == '/listgames':
+        elif command == '/rooms':
             rooms = self.game_manager.list_rooms()
             if not rooms:
                 print("\n[系统] 当前没有活动游戏房间")
@@ -1710,7 +1725,7 @@ class ChatNode:
             print("   /start_game <gomoku|guess> [参数] 创建小游戏")
             print("   /join_game <game_id> 加入小游戏")
             print("   /game <game_id> <动作> 进行游戏动作")
-            print("   /list_games 列出当前所有小游戏")
+            print("   /games 列出当前所有小游戏")
             print("   /end_game <game_id> 结束你创建的小游戏")
             print("   /history 查看最近聊天记录（包含私聊）")
             print("   /msg <昵称> <消息> 发送私聊")
@@ -1719,7 +1734,7 @@ class ChatNode:
             print("   /host <游戏名> [端口] 创建游戏房间（你自动成为主机）")
             print("   /join <游戏名> 加入游戏房间（你成为参与者）")
             print("   /leave <游戏名> 退出你加入的游戏房间")
-            print("   /listgames 列出所有活动房间")
+            print("   /rooms 列出所有活动房间")
             print("   /stopgame <游戏名> 结束你作为主机的游戏")
         else:
             print(f"\n[系统] 未知命令: {command}，输入 /help 查看帮助")
