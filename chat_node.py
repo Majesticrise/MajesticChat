@@ -148,7 +148,8 @@ class GuessNumberGame(BaseGame):
         self.range_low = range_low
         self.range_high = range_high
         self.max_attempts = max_attempts
-        self.attempts = 0
+        # 每玩家独立尝试次数
+        self.attempts = {p: 0 for p in players}
         self.guessed = set()
         self.guess_history = []
         self.secret_number = secrets.randbelow(range_high - range_low + 1) + range_low
@@ -180,16 +181,24 @@ class GuessNumberGame(BaseGame):
             return False, "该数字已被猜过"
         self.guessed.add(guess)
         self.guess_history.append({"player": player, "guess": guess})
-        self.attempts += 1
+        # 更新该玩家的尝试次数
+        self.attempts[player] = self.attempts.get(player, 0) + 1
         if guess == self.secret_number:
             self.finished = True
             self.winner = player
             return True, f"恭喜 {player} 猜中了数字 {guess}，获胜！"
-        if self.attempts >= self.max_attempts:
-            self.finished = True
-            return True, f"次数用尽，游戏结束。正确答案是 {self.secret_number}。"
+        # 检查该玩家是否耗尽个人次数
+        if self.attempts.get(player, 0) >= self.max_attempts:
+            # 若所有参与者均耗尽，则结束游戏
+            all_exhausted = all(self.attempts.get(p, 0) >= self.max_attempts for p in self.players)
+            if all_exhausted:
+                self.finished = True
+                return True, f"所有玩家次数用尽，游戏结束。正确答案是 {self.secret_number}。"
+            else:
+                return True, f"{player} 的尝试次数已用尽。其他玩家仍可继续。"
         hint = "偏大" if guess > self.secret_number else "偏小"
-        return True, f"{player} 的猜测 {guess} {hint}，剩余次数 {self.max_attempts - self.attempts}"
+        remaining = self.max_attempts - self.attempts.get(player, 0)
+        return True, f"{player} 的猜测 {guess} {hint}，剩余次数 {remaining}"
 
     def get_state(self):
         return {
