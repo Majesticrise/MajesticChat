@@ -36,8 +36,8 @@ jobs:
             --hidden-import=chat_node `
             --hidden-import=easytier_utils `
             --hidden-import=chat_main `
-            --add-data "easytier-core.exe;." `
-            --add-data "easytier-cli.exe;." `
+            --add-data "easytier-core.exe;." \
+            --add-data "easytier-cli.exe;."
             chat_main.py
 
       - name: Compress build folder
