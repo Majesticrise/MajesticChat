@@ -26,19 +26,10 @@ jobs:
       - name: Install PyInstaller
         run: pip install pyinstaller
 
+        
       - name: Build EXE with PyInstaller
         run: |
-          pyinstaller -D -n MajesticChat `
-            --uac-admin `
-            --console `
-            --hidden-import=sqlite3 `
-            --hidden-import=chat_config `
-            --hidden-import=chat_node `
-            --hidden-import=easytier_utils `
-            --hidden-import=chat_main `
-            --add-data "easytier-core.exe;." \
-            --add-data "easytier-cli.exe;."
-            chat_main.py
+          pyinstaller -D -n MajesticChat --uac-admin --console --hidden-import=sqlite3 --hidden-import=chat_config --hidden-import=chat_node --hidden-import=easytier_utils --hidden-import=chat_main --add-data "easytier-core.exe;." --add-data "easytier-cli.exe;." chat_main.py
 
       - name: Compress build folder
         run: Compress-Archive -Path dist/MajesticChat/* -DestinationPath MajesticChat.zip
