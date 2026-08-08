@@ -377,9 +377,14 @@ class ChatNode:
             log_error(f"发送同步请求到 {peer_ip} 失败: {e}")
 
     async def receive_messages(self, reader, ip):
+        reader.set_read_limit(1024 * 1024)  # 设置 1MB 限制，容纳 Base64 编码的文件块
         try:
             while self.running:
-                data = await reader.readline()
+                try:
+                    data = await asyncio.wait_for(reader.readline(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    print(f"[系统] 从 {ip} 读取数据超时，断开连接")
+                    break
                 if not data:
                     break
                 raw = data.decode('utf-8', errors='replace').strip()
@@ -394,7 +399,7 @@ class ChatNode:
                         if unwrapped is None:
                             print(f"[警告] 收到无效的安全消息，来自 {ip}")
                             await self._close_connection(ip)
-                            break
+                            continue
                         msg = unwrapped
                     msg_type = self._as_str(msg.get("type"), "")
                     if msg_type == "ping":
