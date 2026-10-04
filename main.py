@@ -1,16 +1,20 @@
 """
 MajesticLink 入口
-阶段 3：控制通道 + 文字聊天
+阶段 5：控制通道 + 文字聊天 + 文件传输 + 游戏房间 + 语音通话 + 全局热键 + 延迟显示
 """
 import asyncio
 import os
 import sys
+import threading
 import time
 import traceback
 
 from core.config import APP_NAME, APP_VERSION
 from core.event_bus import EventBus, Events
 from features.chat_manager import ChatManager
+from features.file_manager import FileManager
+from features.game_manager import GameManager
+from features.voice_manager import VoiceManager
 from gui.main_window import MainWindow
 from network.control_channel import ControlChannel
 from network.crypto import Crypto
@@ -24,7 +28,6 @@ from storage.database import Database
 def ask_config() -> dict:
     from gui.config_dialog import ConfigDialog
 
-    # 判断是否在控制台环境（开发时）
     has_stdin = False
     try:
         has_stdin = sys.stdin is not None and sys.stdin.isatty()
@@ -44,7 +47,6 @@ def ask_config() -> dict:
             "username": username,
         }
 
-    # 打包环境（windowed）：GUI 弹窗
     dialog = ConfigDialog(
         default_name="MajesticLink",
         default_secret="majesticlink-default-secret",
@@ -62,6 +64,7 @@ def main():
     easytier = EasyTierManager()
     runtime = None
     control = None
+    voice_mgr = None
     window = None
 
     try:
@@ -95,21 +98,55 @@ def main():
         control = ControlChannel(cfg["username"], crypto, event_bus)
         db = Database()
         chat = ChatManager(cfg["username"], control, db, event_bus, runtime)
+        file_mgr = FileManager(cfg["username"], control, event_bus, runtime)
+        game_mgr = GameManager(cfg["username"], self_ip, control, event_bus)
+        voice_mgr = VoiceManager(cfg["username"], self_ip, control, runtime, event_bus)
 
-        # 底层发现新节点 → 主动连接
+        # 底层发现新节点 → 主动连接（只有 IP 小的一方发起，避免连接对冲）
+        def _ip_less(a: str, b: str) -> bool:
+            try:
+                ta = tuple(int(x) for x in a.split("."))
+                tb = tuple(int(x) for x in b.split("."))
+                return ta < tb
+            except Exception:
+                return a < b
+
         def on_peer_discovered(data):
             ip = data.get("ip")
-            if ip and ip != self_ip:
-                asyncio.run_coroutine_threadsafe(
-                    control.connect_to_peer(ip), runtime.loop
-                )
+            if not ip or ip == self_ip:
+                return
+            if not _ip_less(self_ip, ip):
+                return
+            asyncio.run_coroutine_threadsafe(
+                control.connect_to_peer(ip), runtime.loop
+            )
 
         event_bus.subscribe(Events.PEER_DISCOVERED, on_peer_discovered)
 
-        # ---- 异步初始化 ----
+        # 游戏房间广播：GUI 线程 → 后台 asyncio
+        def on_game_broadcast(data):
+            asyncio.run_coroutine_threadsafe(
+                control.broadcast(data), runtime.loop
+            )
+
+        event_bus.subscribe("game_broadcast_rooms", on_game_broadcast)
+
+        # ---- 异步初始化（每个模块独立异常隔离，避免一个崩溃拖垮全部）----
         async def async_setup():
-            await control.start_server()
-            await chat.start()
+            async def safe_start(name, coro):
+                try:
+                    await coro
+                    print(f"[Main] {name} 已启动")
+                except Exception as e:
+                    print(f"[Main] {name} 启动失败: {e}")
+                    traceback.print_exc()
+
+            await safe_start("ControlServer", control.start_server())
+            await safe_start("ChatManager", chat.start())
+            await safe_start("FileManager", file_mgr.start())
+            await safe_start("GameManager", game_mgr.start())
+            await safe_start("VoiceManager", voice_mgr.start())
+
             asyncio.create_task(discovery.start())
             print("[Main] 系统就绪")
 
@@ -120,7 +157,26 @@ def main():
             Events.SYSTEM_MESSAGE,
             {"content": f"已上线 · 昵称: {cfg['username']} · IP: {self_ip}"}
         )
-        window = MainWindow(event_bus)
+
+        # 把 control 传给 GUI，用于查询延迟
+        window = MainWindow(event_bus, control=control)
+
+        # ===== GUI 创建后，补发已连接用户事件（防止时序错过）=====
+        def _republish_connected_peers():
+            time.sleep(2.0)   # 等 GUI 完全就绪
+            try:
+                for ip, conn in list(control.connections.items()):
+                    if conn.handshake_done and conn.username:
+                        event_bus.publish(
+                            Events.PEER_JOINED,
+                            {"ip": ip, "name": conn.username}
+                        )
+                        print(f"[Main] 补发 PEER_JOINED: {conn.username} ({ip})")
+            except Exception as e:
+                print(f"[Main] 补发用户事件失败: {e}")
+
+        threading.Thread(target=_republish_connected_peers, daemon=True).start()
+
         window.run()
 
     except Exception as e:
@@ -128,8 +184,15 @@ def main():
         traceback.print_exc()
 
     finally:
-        # ---- 无论如何都执行清理 ----
         print("[Main] 正在清理资源...")
+        try:
+            if voice_mgr and runtime and runtime.loop:
+                asyncio.run_coroutine_threadsafe(
+                    voice_mgr.stop(), runtime.loop
+                ).result(timeout=3)
+        except Exception:
+            pass
+
         try:
             if control and runtime and runtime.loop:
                 asyncio.run_coroutine_threadsafe(
@@ -153,7 +216,6 @@ def main():
 
 
 if __name__ == "__main__":
-    # --windowed 模式下 sys.stdout/stderr 为 None，重定向到 devnull
     if sys.stdout is None:
         sys.stdout = open(os.devnull, "w", encoding="utf-8")
     if sys.stderr is None:
