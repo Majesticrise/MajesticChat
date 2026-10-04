@@ -31,7 +31,8 @@ class MsgType:
     GAME_JOIN = "game_join"
     GAME_LEAVE = "game_leave"
     GAME_STOP = "game_stop"
-    GAME_LIST = "game_list"
+    GAME_LIST = "game_list"       # 新节点加入时，主机主动推送当前房间列表
+    GAME_STATE = "game_state"     # 房间状态变化（有人加入/离开）
 
     # 语音会话控制（只走控制通道通知谁加入了语音，音频走 UDP）
     VOICE_JOIN = "voice_join"

@@ -74,3 +74,22 @@ DB_PATH = os.path.join(BASE_DIR, "chat_history.db")
 SETTINGS_PATH = os.path.join(BASE_DIR, "settings.json")
 RECEIVED_FILES_DIR = os.path.join(BASE_DIR, "received_files")
 LOG_FILE = os.path.join(BASE_DIR, "error.log")
+
+# ========== 音频参数 ==========
+SAMPLE_RATE = 16000
+CHANNELS = 1
+FRAME_DURATION_MS = 20
+FRAME_SIZE = SAMPLE_RATE * FRAME_DURATION_MS // 1000   # 320
+OPUS_BITRATE = 24000
+
+# 抖动缓冲（毫秒）
+JITTER_BUFFER_MIN_MS = 40
+JITTER_BUFFER_MAX_MS = 100
+JITTER_BUFFER_DEFAULT_MS = 60
+
+# VAD
+VAD_ENERGY_THRESHOLD = 500
+VAD_SILENCE_FRAMES = 15   # 连续 15 帧静音（300ms）后停止发送
+
+# UDP 语音端口
+VOICE_PORT = 8889

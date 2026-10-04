@@ -3,6 +3,7 @@ TCP 控制通道：
 - 监听 / 主动连接对等节点
 - 握手认证、会话密钥派生
 - 心跳保活（Ping/Pong）
+- RTT 延迟统计
 - 消息分发（通过 EventBus 抛给上层 feature 模块）
 """
 import asyncio
@@ -32,6 +33,10 @@ class ConnectionState:
         self.last_pong = time.time()
         self.is_initiator = False
         self.handshake_done = False
+
+        # ===== 延迟统计 =====
+        self.rtt_ms: float = -1.0          # 最近一次 RTT（毫秒）
+        self._ping_sent_at: float = 0.0    # 本次 ping 发送时刻
 
 
 class ControlChannel:
@@ -156,10 +161,17 @@ class ControlChannel:
         if not conn.handshake_done:
             conn.handshake_done = True
             print(f"[Control] 与 {conn.ip} 握手完成，用户: {name}")
-            self.event_bus.publish(
-                Events.PEER_JOINED,
-                {"ip": conn.ip, "name": name}
-            )
+            # 延迟 1 秒发布，确保 GUI 已订阅，避免事件时序问题
+            asyncio.create_task(self._publish_peer_joined_later(conn.ip, name))
+
+    async def _publish_peer_joined_later(self, ip: str, name: str):
+        """延迟发布 PEER_JOINED，确保 GUI 已经订阅事件"""
+        await asyncio.sleep(1.0)
+        self.event_bus.publish(
+            Events.PEER_JOINED,
+            {"ip": ip, "name": name}
+        )
+        print(f"[Control] 已发布 PEER_JOINED: {name} ({ip})")
 
     # ========== 接收循环 ==========
     async def _receive_loop(self, ip: str):
@@ -206,6 +218,14 @@ class ControlChannel:
                     await self._send(ip, make_pong())
                 elif msg_type == MsgType.PONG:
                     conn.last_pong = time.time()
+                    # ===== 计算 RTT =====
+                    if conn._ping_sent_at > 0:
+                        conn.rtt_ms = (conn.last_pong - conn._ping_sent_at) * 1000.0
+                        conn._ping_sent_at = 0.0
+                        self.event_bus.publish(
+                            "peer_latency",
+                            {"ip": conn.ip, "rtt_ms": conn.rtt_ms}
+                        )
                 else:
                     # 业务消息：抛给上层
                     self.event_bus.publish(
@@ -269,6 +289,8 @@ class ControlChannel:
                     to_disconnect.append(ip)
                 elif conn.handshake_done:
                     try:
+                        # ===== 记录发送时刻，用于计算 RTT =====
+                        conn._ping_sent_at = time.time()
                         await self._send(ip, make_ping())
                     except Exception:
                         to_disconnect.append(ip)
@@ -295,6 +317,28 @@ class ControlChannel:
         print(f"[Control] 断开 {ip} ({name})")
         self.event_bus.publish(Events.PEER_LEFT, {"ip": ip, "name": name})
 
+    async def send_to_raw(self, ip: str, payload: Mapping[str, Any]) -> bool:
+        """发送不加密的消息（用于文件传输，因为 EasyTier 已经加密隧道）"""
+        conn = self.connections.get(ip)
+        if not conn:
+            return False
+        try:
+            async with conn.write_lock:
+                conn.writer.write((json.dumps(payload) + "\n").encode("utf-8"))
+                await conn.writer.drain()
+            return True
+        except Exception as e:
+            print(f"[Control] 向 {ip} 发送失败: {e}")
+            return False
+
+    # ========== 查询 ==========
     def is_connected(self, ip: str) -> bool:
         conn = self.connections.get(ip)
         return conn is not None and conn.handshake_done
+
+    def get_latency(self, ip: str) -> float:
+        """返回与对端的最近 RTT（毫秒），未测量返回 -1"""
+        conn = self.connections.get(ip)
+        if not conn:
+            return -1.0
+        return conn.rtt_ms

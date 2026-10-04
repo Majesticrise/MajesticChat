@@ -1,8 +1,5 @@
 """
-文字聊天管理
-- 监听用户输入 → 广播
-- 监听网络消息 → 存库 + 通知 GUI
-- 历史同步
+文字聊天管理 + 命令分发
 """
 import asyncio
 import time
@@ -30,30 +27,72 @@ class ChatManager:
         self.event_bus.subscribe("user_send_message", self._on_user_send)
         self.event_bus.subscribe("control_message", self._on_control_message)
 
-    # ========== 用户发出（从 GUI 线程调用）==========
+    # ========== 用户输入 ==========
     def _on_user_send(self, data: Mapping[str, Any]):
         content = data.get("content", "").strip()
         if not content:
             return
-        # 用 runtime.submit 提交到后台 asyncio 循环
+        if content.startswith("/"):
+            self._handle_command(content)
+            return
         self.runtime.submit(self._do_send(content))
+
+    def _handle_command(self, content: str):
+        parts = content.split()
+        head = parts[0].lower()
+
+        # 游戏相关：转发给 GameManager
+        if head in ("/host", "/join", "/rooms", "/leave", "/stopgame"):
+            self.event_bus.publish("user_command", {"command": content})
+            return
+
+        # /send <昵称> <路径>
+        if head == "/send":
+            if len(parts) < 3:
+                self._sys_msg("用法: /send <昵称> <文件路径>")
+                return
+            target_name = parts[1]
+            file_path = " ".join(parts[2:])
+            self.event_bus.publish("user_send_file", {
+                "target_name": target_name,
+                "file_path": file_path,
+            })
+            return
+
+        # /cancel <id> 或 /cancel all
+        if head == "/cancel":
+            if len(parts) < 2:
+                self._sys_msg("用法: /cancel <传输ID> 或 /cancel all")
+                return
+            self.event_bus.publish("user_cancel_file", {"target": parts[1]})
+            return
+
+        # /help
+        if head == "/help":
+            self._sys_msg(
+                "可用命令:\n"
+                "  /send <昵称> <路径>   发送文件\n"
+                "  /cancel <传输ID|all>  取消文件传输\n"
+                "  /host <游戏> [端口]   创建游戏房间\n"
+                "  /join <游戏>          加入游戏房间\n"
+                "  /rooms                列出所有房间\n"
+                "  /leave <游戏>         退出房间\n"
+                "  /stopgame <游戏>      结束自己的房间"
+            )
+            return
+
+        self._sys_msg(f"未知命令: {head}")
 
     async def _do_send(self, content: str):
         t = time.time()
         self.msg_counter += 1
         msg_id = f"{self.username}_{int(t * 1000)}_{self.msg_counter}"
         payload = make_chat(self.username, content, t, msg_id)
-        # 先存库
         self.db.save_message(t, self.username, content, msg_id, "chat")
-        # 广播
         await self.control.broadcast(payload)
-        # 通知 GUI
-        self.event_bus.publish(
-            Events.CHAT_SENT,
-            {"content": content, "time": t}
-        )
+        self.event_bus.publish(Events.CHAT_SENT, {"content": content, "time": t})
 
-    # ========== 网络收到（从 asyncio 线程调用）==========
+    # ========== 网络收到 ==========
     def _on_control_message(self, data: Mapping[str, Any]):
         ip = data.get("ip")
         msg = data.get("msg", {})
@@ -96,7 +135,6 @@ class ChatManager:
             print(f"[Chat] 与 {ip} 同步完成")
 
     async def _serve_sync(self, ip: str, last_id: int):
-        """响应对方的同步请求，分批发送缺失消息"""
         offset = 0
         while True:
             rows = self.db.get_since_id(last_id, SYNC_BATCH_SIZE, offset)
@@ -115,9 +153,5 @@ class ChatManager:
             await asyncio.sleep(0.02)
         await self.control.send_to(ip, {"type": MsgType.SYNC_END})
 
-    async def request_sync(self, ip: str):
-        """主动请求与某节点同步"""
-        await self.control.send_to(ip, {
-            "type": MsgType.SYNC_REQ,
-            "last_msg_id": self._last_synced_msg_id,
-        })
+    def _sys_msg(self, content: str):
+        self.event_bus.publish(Events.SYSTEM_MESSAGE, {"content": content})
