@@ -50,7 +50,8 @@ def start_easytier(network_name: str, network_secret: str, config_dir: str):
         "--dhcp"
     ]
     try:
-        easytier_proc = subprocess.Popen(cmd, creationflags=0)
+        log_file = open(os.path.join(config_dir, "easytier.log"), "a")
+        easytier_proc = subprocess.Popen(cmd, stdout=log_file, stderr=log_file, creationflags=0)
         print("✅ EasyTier 核心服务已启动，正在组网...")
         time.sleep(4)
         if easytier_proc.poll() is not None:
