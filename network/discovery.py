@@ -1,7 +1,8 @@
 """
-节点发现
-每 DISCOVERY_INTERVAL 秒轮询 EasyTier peer 列表，
-发现新节点时发布 PEER_JOINED 事件，节点离线时发布 PEER_LEFT。
+节点发现（带容错）
+每 DISCOVERY_INTERVAL 秒轮询 EasyTier peer 列表。
+发现新节点时发布 PEER_DISCOVERED 触发连接；
+连续 OFFLINE_THRESHOLD 次未发现才判定离线（避免闪烁）。
 """
 import asyncio
 
@@ -9,7 +10,8 @@ from core.event_bus import EventBus, Events
 from network.easytier_manager import EasyTierManager
 from network.peer_manager import PeerManager
 
-DISCOVERY_INTERVAL = 15   # 秒
+DISCOVERY_INTERVAL = 15      # 秒
+OFFLINE_THRESHOLD = 3        # 连续 3 次未发现才判定离线（约 45 秒）
 
 
 class Discovery:
@@ -22,12 +24,12 @@ class Discovery:
         self.event_bus = event_bus
         self.self_ip: str | None = None
         self._running = False
+        self._missing_count: dict[str, int] = {}
 
     async def start(self):
         self._running = True
         self.self_ip = self.easytier.get_self_ip()
         print(f"[Discovery] 本机虚拟 IP: {self.self_ip}")
-        # 立即执行一次，然后进入循环
         try:
             await self._refresh_once()
         except Exception as e:
@@ -49,26 +51,34 @@ class Discovery:
         current_ips.discard(self.self_ip)
         known = self.peer_manager.all_ips()
 
-        # 新节点
+        # 新节点：只触发连接（不发布 PEER_JOINED，由 ControlChannel 握手后发布）
         for ip in current_ips - known:
             self.peer_manager.add_or_update(ip)
-            peer = self.peer_manager.get(ip)
+            self._missing_count[ip] = 0
             print(f"[Discovery] 发现新节点: {ip}")
             self.event_bus.publish(
-                Events.PEER_JOINED,
-                {"ip": ip, "name": peer.name or ip}
+                Events.PEER_DISCOVERED,
+                {"ip": ip}
             )
 
-        # 离线节点
+        # 已有节点：重置未发现计数
+        for ip in current_ips & known:
+            self.peer_manager.add_or_update(ip)
+            self._missing_count[ip] = 0
+
+        # 未出现的节点：累计未发现次数
         for ip in known - current_ips:
-            peer = self.peer_manager.get(ip)
-            name = peer.name if peer else ip
-            self.peer_manager.remove(ip)
-            print(f"[Discovery] 节点离线: {ip}")
-            self.event_bus.publish(
-                Events.PEER_LEFT,
-                {"ip": ip, "name": name}
-            )
+            self._missing_count[ip] = self._missing_count.get(ip, 0) + 1
+            if self._missing_count[ip] >= OFFLINE_THRESHOLD:
+                peer = self.peer_manager.get(ip)
+                name = peer.name if peer else ip
+                self.peer_manager.remove(ip)
+                self._missing_count.pop(ip, None)
+                print(f"[Discovery] 节点离线: {ip} ({name})")
+                self.event_bus.publish(
+                    Events.PEER_LEFT,
+                    {"ip": ip, "name": name}
+                )
 
     def stop(self):
         self._running = False

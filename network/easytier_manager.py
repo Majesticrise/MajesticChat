@@ -11,10 +11,15 @@ import time
 from core.config import BASE_DIR, CLI_EXE, CORE_EXE, CONFIG_DIR, RELAY_PEERS
 
 
+# Windows 下隐藏子进程窗口
+_CREATE_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
+
 class EasyTierManager:
     def __init__(self):
         self.proc = None
 
+    # ========== 文件检查 ==========
     def check_files(self) -> bool:
         missing = []
         if not os.path.exists(CORE_EXE):
@@ -27,6 +32,7 @@ class EasyTierManager:
             return False
         return True
 
+    # ========== 启动 / 停止 ==========
     def start(self, network_name: str, network_secret: str) -> bool:
         if not self.check_files():
             return False
@@ -34,13 +40,14 @@ class EasyTierManager:
             print("[EasyTier] 已在运行")
             return True
 
-        # 清理可能残留的 EasyTier 进程
+        # 清理可能残留的 EasyTier 进程（静默执行）
         if sys.platform == "win32":
             try:
                 subprocess.run(
                     ["taskkill", "/f", "/im", "easytier-core.exe"],
                     capture_output=True, encoding='utf-8',
-                    errors='ignore', timeout=2
+                    errors='ignore', timeout=2,
+                    creationflags=_CREATE_NO_WINDOW,
                 )
             except Exception:
                 pass
@@ -53,23 +60,30 @@ class EasyTierManager:
             "--network-secret", network_secret,
             "--config-dir", CONFIG_DIR,
             "--peers", RELAY_PEERS,
-            "--use-smoltcp",     # 用户态网络栈，无需 TUN 驱动
+            "--use-smoltcp",
             "--dhcp",
         ]
 
+        # 将 EasyTier 输出重定向到日志文件（便于 windowed 模式下排查）
+        log_path = os.path.join(BASE_DIR, "easytier.log")
         try:
-            creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            log_file = open(log_path, "a", encoding="utf-8")
+        except Exception:
+            log_file = subprocess.DEVNULL
+
+        try:
             self.proc = subprocess.Popen(
                 cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=creationflags,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                creationflags=_CREATE_NO_WINDOW,
             )
             print("[EasyTier] 核心服务已启动，等待组网...")
             time.sleep(4)
 
             if self.proc.poll() is not None:
                 print(f"[EasyTier] 进程意外退出，返回码 {self.proc.returncode}")
+                print(f"[EasyTier] 请查看日志: {log_path}")
                 self.proc = None
                 return False
 
@@ -81,14 +95,33 @@ class EasyTierManager:
             return False
 
     def stop(self):
+        """停止 EasyTier，确保进程被杀掉"""
         if self.proc:
             try:
                 self.proc.terminate()
-                self.proc.wait(timeout=5)
+                try:
+                    self.proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    # terminate 不奏效，强制 kill
+                    self.proc.kill()
+                    self.proc.wait(timeout=2)
             except Exception:
                 pass
             self.proc = None
-            print("[EasyTier] 已停止")
+
+        # 兜底：清理所有残留的 easytier-core 进程（静默执行）
+        if sys.platform == "win32":
+            try:
+                subprocess.run(
+                    ["taskkill", "/f", "/im", "easytier-core.exe"],
+                    capture_output=True, encoding='utf-8',
+                    errors='ignore', timeout=3,
+                    creationflags=_CREATE_NO_WINDOW,
+                )
+            except Exception:
+                pass
+
+        print("[EasyTier] 已停止")
 
     def is_running(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
@@ -99,7 +132,8 @@ class EasyTierManager:
             result = subprocess.run(
                 [CLI_EXE] + list(args),
                 capture_output=True, text=True,
-                encoding='utf-8', errors='ignore', timeout=10
+                encoding='utf-8', errors='ignore', timeout=10,
+                creationflags=_CREATE_NO_WINDOW,
             )
             return result.stdout
         except Exception as e:

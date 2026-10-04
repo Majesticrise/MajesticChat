@@ -41,9 +41,34 @@ def get_base_dir() -> str:
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+
+def _find_exe(filename: str) -> str:
+    """
+    在多个可能的位置查找 EasyTier 可执行文件：
+    1. 主程序同目录（--onedir 传统行为）
+    2. _internal 子目录（PyInstaller 6.x 新行为）
+    3. sys._MEIPASS（--onefile 模式）
+    返回第一个存在的路径，若都不存在则返回默认路径（供报错提示）
+    """
+    base = get_base_dir()
+    candidates = [
+        os.path.join(base, filename),
+        os.path.join(base, "_internal", filename),
+    ]
+    # PyInstaller 单文件模式会在运行时注入 sys._MEIPASS
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(os.path.join(meipass, filename))
+
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return os.path.join(base, filename)
+
+
 BASE_DIR = get_base_dir()
-CORE_EXE = os.path.join(BASE_DIR, "easytier-core.exe")
-CLI_EXE = os.path.join(BASE_DIR, "easytier-cli.exe")
+CORE_EXE = _find_exe("easytier-core.exe")
+CLI_EXE = _find_exe("easytier-cli.exe")
 CONFIG_DIR = os.path.join(BASE_DIR, ".easytier")
 DB_PATH = os.path.join(BASE_DIR, "chat_history.db")
 SETTINGS_PATH = os.path.join(BASE_DIR, "settings.json")

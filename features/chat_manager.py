@@ -17,49 +17,47 @@ from storage.database import Database
 
 class ChatManager:
     def __init__(self, username: str, control: ControlChannel,
-                 db: Database, event_bus: EventBus):
+                 db: Database, event_bus: EventBus, runtime):
         self.username = username
         self.control = control
         self.db = db
         self.event_bus = event_bus
+        self.runtime = runtime
         self._last_synced_msg_id = db.max_msg_id()
         self.msg_counter = 0
 
     async def start(self):
-        # 监听用户输入（由 GUI 发布）
         self.event_bus.subscribe("user_send_message", self._on_user_send)
-        # 监听网络消息
         self.event_bus.subscribe("control_message", self._on_control_message)
 
-    # ========== 用户发出 ==========
+    # ========== 用户发出（从 GUI 线程调用）==========
     def _on_user_send(self, data: Mapping[str, Any]):
         content = data.get("content", "").strip()
         if not content:
             return
-        # 提交给后台事件循环执行（因为是从 GUI 线程调用）
-        loop = asyncio.get_event_loop()
-        asyncio.run_coroutine_threadsafe(self._do_send(content), loop)
+        # 用 runtime.submit 提交到后台 asyncio 循环
+        self.runtime.submit(self._do_send(content))
 
     async def _do_send(self, content: str):
         t = time.time()
         self.msg_counter += 1
         msg_id = f"{self.username}_{int(t * 1000)}_{self.msg_counter}"
         payload = make_chat(self.username, content, t, msg_id)
-        # 存库
+        # 先存库
         self.db.save_message(t, self.username, content, msg_id, "chat")
         # 广播
         await self.control.broadcast(payload)
-        # 通知 GUI 显示
-        self.event_bus.publish(Events.CHAT_SENT, {"content": content, "time": t})
+        # 通知 GUI
+        self.event_bus.publish(
+            Events.CHAT_SENT,
+            {"content": content, "time": t}
+        )
 
-    # ========== 网络收到 ==========
+    # ========== 网络收到（从 asyncio 线程调用）==========
     def _on_control_message(self, data: Mapping[str, Any]):
         ip = data.get("ip")
         msg = data.get("msg", {})
         msg_type = msg.get("type", "")
-
-        # 需要异步操作的处理丢给事件循环
-        loop = asyncio.get_event_loop()
 
         if msg_type == MsgType.CHAT:
             sender = msg.get("sender", "?")
@@ -85,9 +83,7 @@ class ChatManager:
 
         elif msg_type == MsgType.SYNC_REQ:
             last_id = int(msg.get("last_msg_id", 0))
-            asyncio.run_coroutine_threadsafe(
-                self._serve_sync(ip, last_id), loop
-            )
+            self.runtime.submit(self._serve_sync(ip, last_id))
 
         elif msg_type == MsgType.SYNC_MSG:
             t = msg.get("time", time.time())
@@ -120,7 +116,7 @@ class ChatManager:
         await self.control.send_to(ip, {"type": MsgType.SYNC_END})
 
     async def request_sync(self, ip: str):
-        """主动请求与某节点同步（在握手完成后调用）"""
+        """主动请求与某节点同步"""
         await self.control.send_to(ip, {
             "type": MsgType.SYNC_REQ,
             "last_msg_id": self._last_synced_msg_id,

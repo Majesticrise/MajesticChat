@@ -28,25 +28,23 @@ class MainWindow:
         self.root.geometry("900x650")
         self.root.minsize(700, 500)
 
-        # UI 更新队列：网络/音频线程只往这里塞数据，主线程定时拉取
         self.ui_queue: queue.Queue = queue.Queue()
+
+        # 记录当前在线的 IP，用于去重
+        self._known_ips: set[str] = set()
 
         self._build_layout()
         self._bind_events()
 
-        # 启动队列轮询
         self.root.after(50, self._poll_ui_queue)
-
-        # 关闭窗口时发布退出事件
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ========== 布局 ==========
     def _build_layout(self):
-        # 主分割：上方 (用户列表 + 聊天)，下方 (游戏房间 + 语音 + 输入)
         main_paned = ttk.PanedWindow(self.root, orient=tk.VERTICAL)
         main_paned.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        # ---- 上方区域：横向分割 ----
+        # ---- 上方：用户列表 + 聊天 ----
         top_frame = ttk.Frame(main_paned)
         main_paned.add(top_frame, weight=3)
 
@@ -67,7 +65,7 @@ class MainWindow:
         )
         self.chat_text.pack(fill=tk.BOTH, expand=True, padx=3, pady=3)
 
-        # ---- 下方区域 ----
+        # ---- 下方：游戏房间 + 语音 + 输入 ----
         bottom_frame = ttk.Frame(main_paned)
         main_paned.add(bottom_frame, weight=1)
 
@@ -132,7 +130,7 @@ class MainWindow:
         self.event_bus.subscribe(Events.GAME_ROOM_LIST, self._on_game_room_list)
         self.event_bus.subscribe(Events.VOICE_STATE, self._on_voice_state)
 
-    # ========== 事件处理（在调用线程中执行，一律塞进队列）==========
+    # ========== 事件处理（塞进队列）==========
     def _on_peer_joined(self, data):
         self.ui_queue.put(("peer_joined", data))
 
@@ -167,30 +165,51 @@ class MainWindow:
     def _apply_ui_update(self, kind: str, data):
         if kind == "peer_joined":
             name = data.get("name", "?")
-            items = self.user_listbox.get(0, tk.END)
-            if name not in items:
-                self.user_listbox.insert(tk.END, name)
+            ip = data.get("ip", "")
+            if not ip:
+                return
+            # 用 IP 去重
+            if ip in self._known_ips:
+                return
+            self._known_ips.add(ip)
+            display = f"{name} ({ip})"
+            self.user_listbox.insert(tk.END, display)
+
         elif kind == "peer_left":
+            ip = data.get("ip", "")
             name = data.get("name", "?")
+            if ip in self._known_ips:
+                self._known_ips.discard(ip)
             items = self.user_listbox.get(0, tk.END)
-            if name in items:
-                idx = items.index(name)
-                self.user_listbox.delete(idx)
+            for i, item in enumerate(items):
+                if ip and ip in item:
+                    self.user_listbox.delete(i)
+                    break
+            else:
+                # 万一 IP 匹配不到，用名字兜底
+                if name in items:
+                    idx = items.index(name)
+                    self.user_listbox.delete(idx)
+
         elif kind == "chat_received":
             sender = data.get("sender", "?")
             content = data.get("content", "")
             t = data.get("time")
             time_str = time.strftime("%H:%M:%S", time.localtime(t)) if t else ""
             self._append_chat(f"[{time_str}] [{sender}] {content}")
+
         elif kind == "chat_sent":
             content = data.get("content", "")
             t = data.get("time")
             time_str = time.strftime("%H:%M:%S", time.localtime(t)) if t else ""
             self._append_chat(f"[{time_str}] [我] {content}")
+
         elif kind == "system_message":
             self._append_chat(f"[系统] {data.get('content', '')}")
+
         elif kind == "game_room_list":
             self._refresh_game_rooms(data)
+
         elif kind == "voice_state":
             in_voice = data.get("in_voice", False)
             self.voice_btn.config(text="退出语音" if in_voice else "加入语音")

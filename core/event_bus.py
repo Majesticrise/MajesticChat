@@ -28,27 +28,27 @@ class EventBus:
             try:
                 cb(data)
             except Exception as e:
-                # 避免一个订阅者出错影响其他订阅者
                 print(f"[EventBus] 事件 {event} 回调异常: {e}")
 
 
 # ========== 事件常量 ==========
 class Events:
     # 网络层
-    PEER_JOINED = "peer_joined"              # data: {"ip": str, "name": str}
+    PEER_DISCOVERED = "peer_discovered"      # 底层发现节点（触发连接），data: {"ip": str}
+    PEER_JOINED = "peer_joined"              # 握手完成，data: {"ip": str, "name": str}
     PEER_LEFT = "peer_left"                  # data: {"ip": str, "name": str}
-    PEER_LIST_UPDATED = "peer_list_updated"  # data: list[dict]
-    CONNECTION_TYPE = "connection_type"      # data: {"ip": str, "type": "P2P"|"Relay"}
+    PEER_LIST_UPDATED = "peer_list_updated"
+    CONNECTION_TYPE = "connection_type"
 
     # 聊天
-    CHAT_RECEIVED = "chat_received"          # data: dict
-    CHAT_SENT = "chat_sent"                  # data: dict
+    CHAT_RECEIVED = "chat_received"
+    CHAT_SENT = "chat_sent"
     PRIVATE_RECEIVED = "private_received"
-    SYSTEM_MESSAGE = "system_message"        # data: {"content": str}
+    SYSTEM_MESSAGE = "system_message"
 
     # 文件
     FILE_STARTED = "file_started"
-    FILE_PROGRESS = "file_progress"          # data: {"transfer_id", "progress"}
+    FILE_PROGRESS = "file_progress"
     FILE_FINISHED = "file_finished"
     FILE_FAILED = "file_failed"
 
@@ -58,8 +58,8 @@ class Events:
     GAME_ROOM_LIST = "game_room_list"
 
     # 语音
-    VOICE_STATE = "voice_state"              # data: {"in_voice": bool}
-    VOICE_PEER_SPEAKING = "voice_peer_speaking"  # data: {"name": str, "speaking": bool}
+    VOICE_STATE = "voice_state"
+    VOICE_PEER_SPEAKING = "voice_peer_speaking"
     VOICE_PEER_JOINED = "voice_peer_joined"
     VOICE_PEER_LEFT = "voice_peer_left"
 
