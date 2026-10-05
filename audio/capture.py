@@ -29,16 +29,21 @@ class AudioCapture:
     def start(self):
         if self._running:
             return
-        self._running = True
-        self._stream = sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            channels=CHANNELS,
-            dtype="int16",
-            blocksize=FRAME_SIZE,
-            callback=self._callback,
-        )
-        self._stream.start()
-        print("[Audio] 麦克风已启动")
+        try:
+            self._stream = sd.InputStream(
+                samplerate=SAMPLE_RATE,
+                channels=CHANNELS,
+                dtype="int16",
+                blocksize=FRAME_SIZE,
+                callback=self._callback,
+            )
+            self._stream.start()
+            self._running = True
+            print("[Audio] 麦克风已启动")
+        except Exception as e:
+            self._running = False
+            self._stream = None
+            print(f"[Audio] 麦克风启动失败: {e}")
 
     def stop(self):
         self._running = False

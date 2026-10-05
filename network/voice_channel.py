@@ -32,10 +32,22 @@ class VoiceChannel:
         self._recv_callback = callback
 
     async def start(self):
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind(("0.0.0.0", VOICE_PORT))
-        self.sock.setblocking(False)
+        try:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.sock.bind(("0.0.0.0", VOICE_PORT))
+            self.sock.setblocking(False)
+        except Exception as e:
+            self._running = False
+            if self.sock is not None:
+                try:
+                    self.sock.close()
+                except Exception:
+                    pass
+                self.sock = None
+            print(f"[Voice] UDP 监听失败: {e}")
+            return
+
         self._running = True
         asyncio.create_task(self._recv_loop())
         print(f"[Voice] UDP 监听端口 {VOICE_PORT}")
