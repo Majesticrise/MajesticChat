@@ -122,7 +122,8 @@ class ChatManager:
 
         elif msg_type == MsgType.SYNC_REQ:
             last_id = int(msg.get("last_msg_id", 0))
-            self.runtime.submit(self._serve_sync(ip, last_id))
+            peer_ip = ip if isinstance(ip, str) else ""
+            self.runtime.submit(self._serve_sync(peer_ip, last_id))
 
         elif msg_type == MsgType.SYNC_MSG:
             t = msg.get("time", time.time())

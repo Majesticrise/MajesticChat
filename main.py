@@ -90,6 +90,9 @@ def main():
         event_bus = EventBus()
         runtime = AsyncRuntime()
         runtime.start()
+        if runtime.loop is None:
+            print("❌ AsyncRuntime 启动失败，退出")
+            return
 
         # ---- 组件 ----
         peer_manager = PeerManager()
@@ -141,9 +144,12 @@ def main():
 
         # ---- 异步初始化（每个模块独立异常隔离，避免一个崩溃拖垮全部）----
         async def async_setup():
+            started = []
+
             async def safe_start(name, coro):
                 try:
                     await coro
+                    started.append(name)
                     print(f"[Main] {name} 已启动")
                 except Exception as e:
                     print(f"[Main] {name} 启动失败: {e}")
@@ -155,8 +161,11 @@ def main():
             await safe_start("GameManager", game_mgr.start())
             await safe_start("VoiceManager", voice_mgr.start())
 
-            asyncio.create_task(discovery.start())
-            print("[Main] 系统就绪")
+            if len(started) < 5:
+                print(f"[Main] 启动完成度: {len(started)}/5，部分模块未就绪")
+            else:
+                asyncio.create_task(discovery.start())
+                print("[Main] 系统就绪")
 
         loop = runtime.loop
         if loop is None:

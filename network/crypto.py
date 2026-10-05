@@ -52,8 +52,11 @@ class Crypto:
         payload_b64 = msg.get("payload")
         nonce = msg.get("nonce")
         mac = msg.get("mac")
-        if not all(isinstance(x, str) for x in (payload_b64, nonce, mac)):
+        if payload_b64 is None or nonce is None or mac is None:
             return None
+        payload_b64 = str(payload_b64)
+        nonce = str(nonce)
+        mac = str(mac)
         try:
             masked = base64.b64decode(payload_b64.encode("ascii"))
         except Exception:

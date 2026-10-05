@@ -34,6 +34,8 @@ class ConnectionState:
         self.last_pong = time.time()
         self.is_initiator = False
         self.handshake_done = False
+        self.state = "connecting"
+        self.last_error: Optional[str] = None
 
         # ===== 延迟统计 =====
         self.rtt_ms: float = -1.0          # 最近一次 RTT（毫秒）
@@ -58,6 +60,7 @@ class ControlChannel:
         self._lock: Optional[asyncio.Lock] = None
         self._lock_loop: Optional[asyncio.AbstractEventLoop] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
+        self._connect_retry: Dict[str, int] = {}
 
     def _get_connection_lock(self) -> asyncio.Lock:
         loop = asyncio.get_running_loop()
@@ -87,19 +90,29 @@ class ControlChannel:
 
     # ========== 主动连接 ==========
     async def connect_to_peer(self, ip: str):
+        if not self.running:
+            return
         async with self._get_connection_lock():
-            if ip in self.connections:
-                return
+            existing = self.connections.get(ip)
+            if existing is not None:
+                if existing.state == "ready":
+                    return
+                if existing.state in {"connecting", "handshaking"}:
+                    return
+                self.connections.pop(ip, None)
+
         try:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(ip, CONTROL_PORT),
                 timeout=CONNECT_TIMEOUT,
             )
         except asyncio.TimeoutError:
-            print(f"[Control] 连接 {ip} 超时")
+            self._connect_retry[ip] = self._connect_retry.get(ip, 0) + 1
+            print(f"[Control] 连接 {ip} 超时 (重试 {self._connect_retry[ip]})")
             return
         except Exception as e:
-            print(f"[Control] 连接 {ip} 失败: {e}")
+            self._connect_retry[ip] = self._connect_retry.get(ip, 0) + 1
+            print(f"[Control] 连接 {ip} 失败: {e} (重试 {self._connect_retry[ip]})")
             return
 
         try:
@@ -109,6 +122,8 @@ class ControlChannel:
 
         conn = ConnectionState(ip, reader, writer)
         conn.is_initiator = True
+        conn.state = "handshaking"
+        conn.last_error = None
         conn.ensure_write_lock()
         async with self._get_connection_lock():
             self.connections[ip] = conn
@@ -135,6 +150,8 @@ class ControlChannel:
 
         conn = ConnectionState(ip, reader, writer)
         conn.is_initiator = False
+        conn.state = "handshaking"
+        conn.last_error = None
         conn.ensure_write_lock()
         async with self._get_connection_lock():
             self.connections[ip] = conn
@@ -178,6 +195,8 @@ class ControlChannel:
 
         if not conn.handshake_done:
             conn.handshake_done = True
+            conn.state = "ready"
+            self._connect_retry.pop(conn.ip, None)
             print(f"[Control] 与 {conn.ip} 握手完成，用户: {name}")
             # 延迟 1 秒发布，确保 GUI 已订阅，避免事件时序问题
             asyncio.create_task(self._publish_peer_joined_later(conn.ip, name))
@@ -325,6 +344,8 @@ class ControlChannel:
             conn = self.connections.pop(ip, None)
         if not conn:
             return
+        conn.state = "closed"
+        conn.last_error = "connection_disconnected"
         # 关键：清理会话密钥（避免重连复用旧密钥）
         conn.session_key = None
         conn.handshake_done = False
@@ -336,6 +357,7 @@ class ControlChannel:
         name = conn.username or ip
         print(f"[Control] 断开 {ip} ({name})")
         self.event_bus.publish(Events.PEER_LEFT, {"ip": ip, "name": name})
+        self._connect_retry.pop(ip, None)
 
     async def send_to_raw(self, ip: str, payload: Mapping[str, Any]) -> bool:
         """发送不加密的消息（用于文件传输，因为 EasyTier 已经加密隧道）"""

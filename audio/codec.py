@@ -24,10 +24,10 @@ class OpusCodec:
 
     # ========== 编码器 ==========
     @staticmethod
-    def _create_encoder(cls):
+    def _create_encoder(encoder_cls):
         # 尝试 1：用构造参数
         try:
-            return cls(
+            return encoder_cls(
                 channels=CHANNELS,
                 sample_rate=SAMPLE_RATE,
                 max_bitrate=OPUS_BITRATE,
@@ -37,7 +37,7 @@ class OpusCodec:
 
         # 尝试 2：无参构造 + 逐个 set
         try:
-            enc = cls()
+            enc = encoder_cls()
         except Exception as e:
             raise RuntimeError(f"无法构造 Opus 编码器: {e}")
 
@@ -53,9 +53,9 @@ class OpusCodec:
 
     # ========== 解码器 ==========
     @staticmethod
-    def _create_decoder(cls):
+    def _create_decoder(decoder_cls):
         try:
-            return cls(
+            return decoder_cls(
                 channels=CHANNELS,
                 sample_rate=SAMPLE_RATE,
             )
@@ -63,7 +63,7 @@ class OpusCodec:
             pass
 
         try:
-            dec = cls()
+            dec = decoder_cls()
         except Exception as e:
             raise RuntimeError(f"无法构造 Opus 解码器: {e}")
 

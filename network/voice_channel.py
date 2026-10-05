@@ -52,8 +52,11 @@ class VoiceChannel:
     async def _recv_loop(self):
         loop = asyncio.get_event_loop()
         while self._running:
+            sock = self.sock
+            if sock is None:
+                break
             try:
-                data, addr = await loop.sock_recvfrom(self.sock, 4096)
+                data, addr = await loop.sock_recvfrom(sock, 4096)
             except Exception:
                 if not self._running:
                     break

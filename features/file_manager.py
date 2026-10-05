@@ -191,7 +191,10 @@ class FileManager:
 
     async def _resolve_username(self, username: str) -> Optional[str]:
         """通过控制通道查找用户名对应的 IP"""
-        async with self.control._lock:
+        lock = self.control._lock
+        if lock is None:
+            return None
+        async with lock:
             for ip, conn in self.control.connections.items():
                 if conn.username == username:
                     return ip
@@ -216,13 +219,14 @@ class FileManager:
         ip = data.get("ip")
         msg = data.get("msg", {})
         msg_type = msg.get("type", "")
+        peer_ip = ip if isinstance(ip, str) else ""
 
         if msg_type == MsgType.FILE_START:
-            self.runtime.submit(self._handle_file_start(ip, msg))
+            self.runtime.submit(self._handle_file_start(peer_ip, msg))
         elif msg_type == MsgType.FILE_CHUNK:
-            self.runtime.submit(self._handle_file_chunk(ip, msg))
+            self.runtime.submit(self._handle_file_chunk(peer_ip, msg))
         elif msg_type == MsgType.FILE_ABORT:
-            self.runtime.submit(self._handle_file_abort(ip, msg))
+            self.runtime.submit(self._handle_file_abort(peer_ip, msg))
         elif msg_type == MsgType.FILE_RECEIVED:
             tid = msg.get("transfer_id", "")
             print(f"[File] 对方已接收 {tid}")

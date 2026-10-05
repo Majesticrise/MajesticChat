@@ -1,7 +1,6 @@
 """
 SQLite 聊天记录
 """
-import os
 import sqlite3
 import threading
 import time
