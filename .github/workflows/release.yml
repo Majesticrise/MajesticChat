@@ -1,4 +1,4 @@
-name: Build and Release MajesticChat
+name: Build and Release MajesticLink
 
 on:
   push:
@@ -23,19 +23,61 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install PyInstaller
-        run: pip install pyinstaller
+      - name: Install dependencies
+        run: |
+          pip install pyinstaller
+          pip install sounddevice numpy pyogg keyboard
 
-        
       - name: Build EXE with PyInstaller
         run: |
-          pyinstaller -D -n MajesticChat --uac-admin --console --hidden-import=sqlite3 --hidden-import=chat_config --hidden-import=chat_node --hidden-import=easytier_utils --hidden-import=chat_main --add-data "easytier-core.exe;." --add-data "easytier-cli.exe;." chat_main.py
+          pyinstaller -D -n MajesticLink `
+            --uac-admin `
+            --windowed `
+            --collect-all=pyogg `
+            --collect-all=sounddevice `
+            --collect-all=keyboard `
+            --hidden-import=sqlite3 `
+            --hidden-import=core `
+            --hidden-import=core.config `
+            --hidden-import=core.protocol `
+            --hidden-import=core.event_bus `
+            --hidden-import=network `
+            --hidden-import=network.easytier_manager `
+            --hidden-import=network.peer_manager `
+            --hidden-import=network.discovery `
+            --hidden-import=network.crypto `
+            --hidden-import=network.control_channel `
+            --hidden-import=network.voice_channel `
+            --hidden-import=features `
+            --hidden-import=features.chat_manager `
+            --hidden-import=features.file_manager `
+            --hidden-import=features.game_manager `
+            --hidden-import=features.voice_manager `
+            --hidden-import=storage `
+            --hidden-import=storage.database `
+            --hidden-import=runtime `
+            --hidden-import=runtime.async_runtime `
+            --hidden-import=gui `
+            --hidden-import=gui.main_window `
+            --hidden-import=gui.config_dialog `
+            --hidden-import=audio `
+            --hidden-import=audio.capture `
+            --hidden-import=audio.codec `
+            --hidden-import=audio.jitter_buffer `
+            --hidden-import=audio.mixer `
+            --hidden-import=audio.player `
+            --add-data "easytier-core.exe;." `
+            --add-data "easytier-cli.exe;." `
+            --add-data "Packet.dll;." `
+            --add-data "WinDivert64.sys;." `
+            --add-data "wintun.dll;." `
+            main.py
 
       - name: Compress build folder
-        run: Compress-Archive -Path dist/MajesticChat/* -DestinationPath MajesticChat.zip
+        run: Compress-Archive -Path dist/MajesticLink/* -DestinationPath MajesticLink.zip
 
       - name: Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: MajesticChat.zip
+          files: MajesticLink.zip

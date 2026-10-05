@@ -3,6 +3,7 @@ MajesticLink 入口
 阶段 5：控制通道 + 文字聊天 + 文件传输 + 游戏房间 + 语音通话 + 全局热键 + 延迟显示
 """
 import asyncio
+import configparser
 import os
 import sys
 import threading
@@ -24,9 +25,78 @@ from network.peer_manager import PeerManager
 from runtime.async_runtime import AsyncRuntime
 from storage.database import Database
 
+CONFIG_FILE_NAME = "MajesticLink.ini"
+CONFIG_SECTION = "App"
+
+
+def get_app_config_path() -> str:
+    if getattr(sys, "frozen", False):
+        base_dir = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_dir, CONFIG_FILE_NAME)
+
+
+def default_app_config() -> dict:
+    return {
+        "network_name": "MajesticLink",
+        "network_secret": "majesticlink-default-secret",
+        "username": "Anonymous",
+        "room_password": "",
+        "room_id": "",
+        "voice_volume": "80",
+        "voice_mode": "vad",
+        "ptt_key": "ctrl+shift+v",
+    }
+
+
+def load_app_config() -> dict:
+    config = configparser.ConfigParser()
+    path = get_app_config_path()
+    result = default_app_config()
+    if not os.path.exists(path):
+        return result
+
+    try:
+        config.read(path, encoding="utf-8")
+        if config.has_section(CONFIG_SECTION):
+            for key, default_value in default_app_config().items():
+                value = config.get(CONFIG_SECTION, key, fallback=default_value)
+                if value is not None:
+                    result[key] = str(value).strip()
+    except Exception as e:
+        print(f"[Config] 读取配置失败: {e}")
+    return result
+
+
+def save_app_config(cfg: dict):
+    path = get_app_config_path()
+    parser = configparser.ConfigParser()
+    parser[CONFIG_SECTION] = {
+        "network_name": str(cfg.get("network_name", "MajesticLink")).strip() or "MajesticLink",
+        "network_secret": str(cfg.get("network_secret", "majesticlink-default-secret")).strip() or "majesticlink-default-secret",
+        "username": str(cfg.get("username", "Anonymous")).strip() or "Anonymous",
+        "room_password": str(cfg.get("room_password", "")).strip(),
+        "room_id": str(cfg.get("room_id", "")).strip(),
+        "voice_volume": str(cfg.get("voice_volume", "80")).strip() or "80",
+        "voice_mode": str(cfg.get("voice_mode", "vad")).strip() or "vad",
+        "ptt_key": str(cfg.get("ptt_key", "ctrl+shift+v")).strip() or "ctrl+shift+v",
+    }
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            parser.write(f)
+        print(f"[Config] 配置已保存到: {path}")
+    except Exception as e:
+        print(f"[Config] 保存配置失败: {e}")
+
 
 def ask_config() -> dict:
     from gui.config_dialog import ConfigDialog
+
+    saved_cfg = load_app_config()
+    if saved_cfg.get("network_name") and saved_cfg.get("username"):
+        print(f"[Config] 已从 {get_app_config_path()} 读取配置")
+        return saved_cfg
 
     has_stdin = False
     try:
@@ -38,23 +108,39 @@ def ask_config() -> dict:
         print("\n" + "=" * 50)
         print(f"  {APP_NAME} v{APP_VERSION}")
         print("=" * 50)
-        network_name = input("网络名称 (回车使用默认 MajesticLink): ").strip() or "MajesticLink"
-        network_secret = input("网络密码 (回车使用默认): ").strip() or "majesticlink-default-secret"
-        username = input("你的昵称 (回车使用 Anonymous): ").strip() or "Anonymous"
-        return {
+        network_name = input("网络名称 (回车使用默认 MajesticLink): ").strip() or saved_cfg.get("network_name", "MajesticLink")
+        network_secret = input("网络密码 (回车使用默认): ").strip() or saved_cfg.get("network_secret", "majesticlink-default-secret")
+        username = input("你的昵称 (回车使用 Anonymous): ").strip() or saved_cfg.get("username", "Anonymous")
+        room_password = input("房间密码 (可空，回车跳过): ").strip()
+        room_id = input("房间号 (可空，回车跳过): ").strip()
+        cfg = {
             "network_name": network_name,
             "network_secret": network_secret,
             "username": username,
+            "room_password": room_password,
+            "room_id": room_id,
+            "voice_volume": saved_cfg.get("voice_volume", "80"),
+            "voice_mode": saved_cfg.get("voice_mode", "vad"),
+            "ptt_key": saved_cfg.get("ptt_key", "ctrl+shift+v"),
         }
+        save_app_config(cfg)
+        return cfg
 
     dialog = ConfigDialog(
-        default_name="MajesticLink",
-        default_secret="majesticlink-default-secret",
-        default_username="",
+        default_name=saved_cfg.get("network_name", "MajesticLink"),
+        default_secret=saved_cfg.get("network_secret", "majesticlink-default-secret"),
+        default_username=saved_cfg.get("username", ""),
     )
     result = dialog.show()
     if result is None:
         sys.exit(0)
+
+    result.setdefault("room_password", saved_cfg.get("room_password", ""))
+    result.setdefault("room_id", saved_cfg.get("room_id", ""))
+    result.setdefault("voice_volume", saved_cfg.get("voice_volume", "80"))
+    result.setdefault("voice_mode", saved_cfg.get("voice_mode", "vad"))
+    result.setdefault("ptt_key", saved_cfg.get("ptt_key", "ctrl+shift+v"))
+    save_app_config(result)
     return result
 
 
