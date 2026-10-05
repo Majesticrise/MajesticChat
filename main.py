@@ -93,9 +93,12 @@ def save_app_config(cfg: dict):
 def ask_config() -> dict:
     from gui.config_dialog import ConfigDialog
 
+    config_path = get_app_config_path()
     saved_cfg = load_app_config()
-    if saved_cfg.get("network_name") and saved_cfg.get("username"):
-        print(f"[Config] 已从 {get_app_config_path()} 读取配置")
+    config_exists = os.path.exists(config_path) and os.path.getsize(config_path) > 0
+
+    if config_exists:
+        print(f"[Config] 已从 {config_path} 读取配置")
         return saved_cfg
 
     has_stdin = False
