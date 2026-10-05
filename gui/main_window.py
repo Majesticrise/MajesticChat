@@ -4,7 +4,7 @@
 - 定时刷新延迟
 """
 import tkinter as tk
-from tkinter import ttk, scrolledtext, filedialog, simpledialog
+from tkinter import ttk, scrolledtext, filedialog, simpledialog, messagebox
 import queue
 import time
 from typing import Optional
@@ -13,9 +13,11 @@ from core.event_bus import EventBus, Events
 
 
 class MainWindow:
-    def __init__(self, event_bus: EventBus, control=None):
+    def __init__(self, event_bus: EventBus, control=None, config: Optional[dict] = None):
         self.event_bus = event_bus
         self.control = control          # 用于查询延迟
+        self.config = config or {}
+        self.config_callback = None
         self.root = tk.Tk()
         self.root.title("MajesticLink - 私人 P2P 联机")
         self.root.geometry("960x680")
@@ -26,10 +28,12 @@ class MainWindow:
         self._peer_items: dict[str, str] = {}
 
         # 当前 PTT 热键（用于显示）
-        self._current_ptt_key = "ctrl+shift+v"
+        self._current_ptt_key = str(self.config.get("ptt_key", "ctrl+shift+v")).strip() or "ctrl+shift+v"
+        self.voice_mode = tk.StringVar()
 
         self._build_layout()
         self._bind_events()
+        self._apply_saved_voice_config()
 
         # UI 队列轮询
         self.root.after(50, self._poll_ui_queue)
@@ -109,7 +113,9 @@ class MainWindow:
         voice_frame = ttk.Frame(bottom_frame)
         voice_frame.pack(fill=tk.X, padx=3, pady=3)
 
-        self.voice_mode = tk.StringVar(value="vad")
+        settings_btn = ttk.Button(voice_frame, text="设置", command=self._open_settings_dialog)
+        settings_btn.pack(side=tk.LEFT, padx=(0, 8))
+
         ttk.Radiobutton(
             voice_frame, text="自由发言 (VAD)",
             variable=self.voice_mode, value="vad",
@@ -327,7 +333,6 @@ class MainWindow:
 
         if len(peers) == 1:
             ip, name = peers[0]
-            from tkinter import messagebox
             if messagebox.askyesno("确认", f"发送给 {name} ？"):
                 return name
             return None
@@ -484,15 +489,92 @@ class MainWindow:
     def _toggle_voice(self):
         self.event_bus.publish("user_toggle_voice")
 
+    def _apply_saved_voice_config(self):
+        if not self.config:
+            return
+        mode = str(self.config.get("voice_mode", "vad")).strip().lower()
+        if mode in {"vad", "ptt"}:
+            self.voice_mode.set(mode)
+        try:
+            volume = float(self.config.get("voice_volume", "80"))
+            self.mic_volume.set(max(0, min(100, int(volume))))
+        except Exception:
+            pass
+
+        key = str(self.config.get("ptt_key", self._current_ptt_key)).strip() or self._current_ptt_key
+        self._current_ptt_key = key.lower()
+        self._refresh_hotkey_label()
+
+    def _refresh_hotkey_label(self):
+        display = "+".join(p.capitalize() for p in self._current_ptt_key.split("+"))
+        self.hotkey_label.config(text=f"热键: {display}")
+
+    def _persist_config(self, key: str, value: object):
+        if not self.config:
+            return
+        self.config[key] = str(value)
+        if self.config_callback is not None:
+            try:
+                self.config_callback(self.config)
+            except Exception:
+                pass
+
+    def _open_settings_dialog(self):
+        from gui.config_dialog import ConfigDialog
+
+        current = self.config.copy() if self.config else {}
+        dialog = ConfigDialog(
+            default_name=current.get("network_name", "MajesticLink"),
+            default_secret=current.get("network_secret", "majesticlink-default-secret"),
+            default_username=current.get("username", ""),
+            default_room_password=current.get("room_password", ""),
+            default_room_id=current.get("room_id", ""),
+            master=self.root,
+        )
+        result = dialog.show()
+        if result is None:
+            return
+
+        old_network_name = str(current.get("network_name", "")).strip()
+        old_network_secret = str(current.get("network_secret", "")).strip()
+        new_network_name = str(result.get("network_name", "")).strip()
+        new_network_secret = str(result.get("network_secret", "")).strip()
+
+        self.config.update(result)
+        self.config.setdefault("room_password", current.get("room_password", ""))
+        self.config.setdefault("room_id", current.get("room_id", ""))
+        self.config.setdefault("voice_volume", current.get("voice_volume", "80"))
+        self.config.setdefault("voice_mode", current.get("voice_mode", "vad"))
+        self.config.setdefault("ptt_key", current.get("ptt_key", "ctrl+shift+v"))
+
+        if self.config_callback is not None:
+            try:
+                self.config_callback(self.config)
+            except Exception:
+                pass
+
+        if (old_network_name != new_network_name) or (old_network_secret != new_network_secret):
+            messagebox.showinfo(
+                "配置已保存",
+                "已更新网络配置，EasyTier 连接参数会在下一次重启程序后生效。\n请重启 MajesticLink 后再继续使用。"
+            )
+
+        if self.config.get("username"):
+            self.event_bus.publish(Events.SYSTEM_MESSAGE, {
+                "content": f"[设置] 已更新配置：昵称={self.config['username']}，网络={self.config.get('network_name')}"
+            })
+
     def _on_volume_change(self, value):
         try:
             vol = float(value)
         except Exception:
             return
+        self._persist_config("voice_volume", int(vol))
         self.event_bus.publish("user_set_volume", {"volume": vol})
 
     def _on_mode_change(self):
         mode = self.voice_mode.get()
+        self._persist_config("voice_mode", mode)
         self.event_bus.publish("user_set_voice_mode", {"mode": mode})
 
     def _on_hotkey_click(self):
@@ -509,8 +591,8 @@ class MainWindow:
         if not key:
             return
         self._current_ptt_key = key
-        display = "+".join(p.capitalize() for p in key.split("+"))
-        self.hotkey_label.config(text=f"热键: {display}")
+        self._persist_config("ptt_key", key)
+        self._refresh_hotkey_label()
         self.event_bus.publish("user_set_ptt_key", {"key": key})
 
     # ========== 关闭 ==========

@@ -4,23 +4,34 @@
 """
 import tkinter as tk
 from tkinter import ttk
-from tkinter import messagebox
+
 
 
 class ConfigDialog:
     def __init__(self, default_name="MajesticLink",
                  default_secret="majesticlink-default-secret",
-                 default_username=""):
+                 default_username="",
+                 default_room_password="",
+                 default_room_id="",
+                 master=None):
         self.result = None
+        self.master = master
         self.default_name = default_name
         self.default_secret = default_secret
         self.default_username = default_username
+        self.default_room_password = default_room_password
+        self.default_room_id = default_room_id
 
     def show(self) -> dict | None:
         """显示对话框，返回配置 dict 或 None（用户取消）"""
-        self.root = tk.Tk()
+        if self.master is None:
+            self.root = tk.Tk()
+        else:
+            self.root = tk.Toplevel(self.master)
+            self.root.transient(self.master)
+            self.root.grab_set()
         self.root.title("MajesticLink 配置")
-        self.root.geometry("420x260")
+        self.root.geometry("420x320")
         self.root.resizable(False, False)
 
         # 居中显示
@@ -49,6 +60,16 @@ class ConfigDialog:
         self.username_var = tk.StringVar(value=self.default_username)
         ttk.Entry(frame, textvariable=self.username_var, width=32).grid(row=2, column=1, pady=8)
 
+        # 房间密码
+        ttk.Label(frame, text="房间密码:").grid(row=3, column=0, sticky=tk.W, pady=8)
+        self.room_password_var = tk.StringVar(value=self.default_room_password)
+        ttk.Entry(frame, textvariable=self.room_password_var, width=32).grid(row=3, column=1, pady=8)
+
+        # 房间号
+        ttk.Label(frame, text="房间号:").grid(row=4, column=0, sticky=tk.W, pady=8)
+        self.room_id_var = tk.StringVar(value=self.default_room_id)
+        ttk.Entry(frame, textvariable=self.room_id_var, width=32).grid(row=4, column=1, pady=8)
+
         # 提示
         hint = ttk.Label(
             frame,
@@ -56,11 +77,11 @@ class ConfigDialog:
             foreground="gray",
             font=("Microsoft YaHei", 8)
         )
-        hint.grid(row=3, column=0, columnspan=2, pady=(5, 10))
+        hint.grid(row=5, column=0, columnspan=2, pady=(5, 10))
 
         # 按钮
         btn_frame = ttk.Frame(frame)
-        btn_frame.grid(row=4, column=0, columnspan=2, pady=10)
+        btn_frame.grid(row=6, column=0, columnspan=2, pady=10)
 
         ttk.Button(btn_frame, text="确定", command=self._on_ok, width=10).pack(side=tk.LEFT, padx=10)
         ttk.Button(btn_frame, text="取消", command=self._on_cancel, width=10).pack(side=tk.LEFT, padx=10)
@@ -71,17 +92,24 @@ class ConfigDialog:
         # 焦点定位到昵称输入框
         self.root.after(100, lambda: self.root.focus_force())
 
-        self.root.mainloop()
+        if self.master is None:
+            self.root.mainloop()
+        else:
+            self.master.wait_window(self.root)
         return self.result
 
     def _on_ok(self):
         name = self.name_var.get().strip() or self.default_name
         secret = self.secret_var.get().strip() or self.default_secret
         username = self.username_var.get().strip() or "Anonymous"
+        room_password = self.room_password_var.get().strip()
+        room_id = self.room_id_var.get().strip()
         self.result = {
             "network_name": name,
             "network_secret": secret,
             "username": username,
+            "room_password": room_password,
+            "room_id": room_id,
         }
         self.root.destroy()
 

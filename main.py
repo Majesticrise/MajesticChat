@@ -130,6 +130,8 @@ def ask_config() -> dict:
         default_name=saved_cfg.get("network_name", "MajesticLink"),
         default_secret=saved_cfg.get("network_secret", "majesticlink-default-secret"),
         default_username=saved_cfg.get("username", ""),
+        default_room_password=saved_cfg.get("room_password", ""),
+        default_room_id=saved_cfg.get("room_id", ""),
     )
     result = dialog.show()
     if result is None:
@@ -264,8 +266,9 @@ def main():
             {"content": f"已上线 · 昵称: {cfg['username']} · IP: {self_ip}"}
         )
 
-        # 把 control 传给 GUI，用于查询延迟
-        window = MainWindow(event_bus, control=control)
+        # 把 control 传给 GUI，用于查询延迟，并让 GUI 与配置文件保持同步
+        window = MainWindow(event_bus, control=control, config=cfg)
+        window.config_callback = lambda new_cfg: save_app_config(new_cfg)
 
         # ===== GUI 创建后，补发已连接用户事件（防止时序错过）=====
         def _republish_connected_peers():
