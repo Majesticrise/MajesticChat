@@ -117,16 +117,24 @@ def main():
                 return
             if not _ip_less(self_ip, ip):
                 return
+            loop = runtime.loop
+            if loop is None:
+                print("[Main] AsyncRuntime 未启动，跳过连接")
+                return
             asyncio.run_coroutine_threadsafe(
-                control.connect_to_peer(ip), runtime.loop
+                control.connect_to_peer(ip), loop
             )
 
         event_bus.subscribe(Events.PEER_DISCOVERED, on_peer_discovered)
 
         # 游戏房间广播：GUI 线程 → 后台 asyncio
         def on_game_broadcast(data):
+            loop = runtime.loop
+            if loop is None:
+                print("[Main] AsyncRuntime 未启动，跳过广播")
+                return
             asyncio.run_coroutine_threadsafe(
-                control.broadcast(data), runtime.loop
+                control.broadcast(data), loop
             )
 
         event_bus.subscribe("game_broadcast_rooms", on_game_broadcast)
@@ -150,7 +158,10 @@ def main():
             asyncio.create_task(discovery.start())
             print("[Main] 系统就绪")
 
-        asyncio.run_coroutine_threadsafe(async_setup(), runtime.loop)
+        loop = runtime.loop
+        if loop is None:
+            raise RuntimeError("AsyncRuntime 未启动，无法初始化后台服务")
+        asyncio.run_coroutine_threadsafe(async_setup(), loop)
 
         # ---- GUI ----
         event_bus.publish(

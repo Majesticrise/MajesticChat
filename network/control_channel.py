@@ -25,7 +25,8 @@ class ConnectionState:
         self.ip = ip
         self.reader = reader
         self.writer = writer
-        self.write_lock = asyncio.Lock()
+        self.write_lock: Optional[asyncio.Lock] = None
+        self._write_lock_loop: Optional[asyncio.AbstractEventLoop] = None
         self.session_key: Optional[bytes] = None
         self.username: str = ""
         self.local_nonce: str = ""
@@ -38,6 +39,13 @@ class ConnectionState:
         self.rtt_ms: float = -1.0          # 最近一次 RTT（毫秒）
         self._ping_sent_at: float = 0.0    # 本次 ping 发送时刻
 
+    def ensure_write_lock(self) -> asyncio.Lock:
+        loop = asyncio.get_running_loop()
+        if self.write_lock is None or self._write_lock_loop is not loop:
+            self.write_lock = asyncio.Lock()
+            self._write_lock_loop = loop
+        return self.write_lock
+
 
 class ControlChannel:
     def __init__(self, username: str, crypto: Crypto, event_bus: EventBus):
@@ -47,8 +55,16 @@ class ControlChannel:
         self.connections: Dict[str, ConnectionState] = {}
         self.server: Optional[asyncio.AbstractServer] = None
         self.running = False
-        self._lock = asyncio.Lock()
+        self._lock: Optional[asyncio.Lock] = None
+        self._lock_loop: Optional[asyncio.AbstractEventLoop] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
+
+    def _get_connection_lock(self) -> asyncio.Lock:
+        loop = asyncio.get_running_loop()
+        if self._lock is None or self._lock_loop is not loop:
+            self._lock = asyncio.Lock()
+            self._lock_loop = loop
+        return self._lock
 
     # ========== 启动 / 停止 ==========
     async def start_server(self):
@@ -71,7 +87,7 @@ class ControlChannel:
 
     # ========== 主动连接 ==========
     async def connect_to_peer(self, ip: str):
-        async with self._lock:
+        async with self._get_connection_lock():
             if ip in self.connections:
                 return
         try:
@@ -87,13 +103,14 @@ class ControlChannel:
             return
 
         try:
-            reader.set_read_limit(1024 * 1024)
+            reader.set_read_limit(1024 * 1024)  # type: ignore[attr-defined]
         except AttributeError:
-            reader._limit = 1024 * 1024
+            reader._limit = 1024 * 1024  # type: ignore[attr-defined]
 
         conn = ConnectionState(ip, reader, writer)
         conn.is_initiator = True
-        async with self._lock:
+        conn.ensure_write_lock()
+        async with self._get_connection_lock():
             self.connections[ip] = conn
         print(f"[Control] 已连接 {ip}")
 
@@ -104,7 +121,7 @@ class ControlChannel:
     async def _handle_connection(self, reader, writer):
         addr = writer.get_extra_info("peername")
         ip = addr[0] if addr else "unknown"
-        async with self._lock:
+        async with self._get_connection_lock():
             if ip in self.connections:
                 try:
                     writer.close()
@@ -112,13 +129,14 @@ class ControlChannel:
                     pass
                 return
         try:
-            reader.set_read_limit(1024 * 1024)
+            reader.set_read_limit(1024 * 1024)  # type: ignore[attr-defined]
         except AttributeError:
-            reader._limit = 1024 * 1024
+            reader._limit = 1024 * 1024  # type: ignore[attr-defined]
 
         conn = ConnectionState(ip, reader, writer)
         conn.is_initiator = False
-        async with self._lock:
+        conn.ensure_write_lock()
+        async with self._get_connection_lock():
             self.connections[ip] = conn
         print(f"[Control] 新连接: {ip}")
 
@@ -243,7 +261,8 @@ class ControlChannel:
     async def _raw_send(self, conn: ConnectionState, payload: Mapping[str, Any]):
         """发送不加密的消息（握手阶段用）"""
         try:
-            async with conn.write_lock:
+            lock = conn.ensure_write_lock()
+            async with lock:
                 conn.writer.write((json.dumps(payload) + "\n").encode("utf-8"))
                 await conn.writer.drain()
         except Exception as e:
@@ -257,7 +276,8 @@ class ControlChannel:
         if conn.session_key:
             payload = self.crypto.wrap(payload, conn.session_key)
         try:
-            async with conn.write_lock:
+            lock = conn.ensure_write_lock()
+            async with lock:
                 conn.writer.write((json.dumps(payload) + "\n").encode("utf-8"))
                 await conn.writer.drain()
             return True
@@ -269,7 +289,7 @@ class ControlChannel:
         return await self._send(ip, payload)
 
     async def broadcast(self, payload: Mapping[str, Any], exclude_ip: Optional[str] = None):
-        async with self._lock:
+        async with self._get_connection_lock():
             ips = [ip for ip in self.connections.keys() if ip != exclude_ip]
         for ip in ips:
             await self._send(ip, payload)
@@ -282,7 +302,7 @@ class ControlChannel:
                 break
             now = time.time()
             to_disconnect = []
-            async with self._lock:
+            async with self._get_connection_lock():
                 items = list(self.connections.items())
             for ip, conn in items:
                 if now - conn.last_pong > HEARTBEAT_INTERVAL * 3:
@@ -301,7 +321,7 @@ class ControlChannel:
     # ========== 断开 ==========
     async def _disconnect(self, ip: str):
         conn = None
-        async with self._lock:
+        async with self._get_connection_lock():
             conn = self.connections.pop(ip, None)
         if not conn:
             return
@@ -323,7 +343,8 @@ class ControlChannel:
         if not conn:
             return False
         try:
-            async with conn.write_lock:
+            lock = conn.ensure_write_lock()
+            async with lock:
                 conn.writer.write((json.dumps(payload) + "\n").encode("utf-8"))
                 await conn.writer.drain()
             return True

@@ -56,7 +56,7 @@ MajesticLink 是一个基于 **EasyTier Overlay Network** 的无中心化通讯�
 
 ### 前置条件
 
-- **Python 3.8+**
+- **Python 3.11+**
 - 从 [EasyTier Releases](https://github.com/zhanghanyun/easytier/releases) 下载对应平台的：
   - `easytier-core.exe`
   - `easytier-cli.exe`
