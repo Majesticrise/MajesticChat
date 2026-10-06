@@ -22,6 +22,8 @@ class ChatManager:
         self.runtime = runtime
         self._last_synced_msg_id = db.max_msg_id()
         self.msg_counter = 0
+        self._seen_message_ids: set[str] = set()
+        self._max_seen_messages = 4096
 
     async def start(self):
         self.event_bus.subscribe("user_send_message", self._on_user_send)
@@ -102,23 +104,37 @@ class ChatManager:
             sender = msg.get("sender", "?")
             content = msg.get("content", "")
             t = msg.get("time", time.time())
-            msg_id = msg.get("msg_id", "")
-            self.db.save_message(t, sender, content, msg_id, "chat")
-            self.event_bus.publish(
-                Events.CHAT_RECEIVED,
-                {"sender": sender, "content": content, "time": t}
-            )
+            msg_id = msg.get("msg_id") or f"{sender}:{t}:{content}"
+            if sender == self.username:
+                return
+            if msg_id in self._seen_message_ids:
+                return
+            self._seen_message_ids.add(msg_id)
+            if len(self._seen_message_ids) > self._max_seen_messages:
+                self._seen_message_ids = set(list(self._seen_message_ids)[-self._max_seen_messages:])
+            if self.db.save_message(t, sender, content, msg_id, "chat"):
+                self.event_bus.publish(
+                    Events.CHAT_RECEIVED,
+                    {"sender": sender, "content": content, "time": t, "msg_id": msg_id}
+                )
 
         elif msg_type == MsgType.PRIVATE:
             sender = msg.get("sender", "?")
             content = msg.get("content", "")
             t = msg.get("time", time.time())
-            msg_id = msg.get("msg_id", "")
-            self.db.save_message(t, sender, content, msg_id, "private")
-            self.event_bus.publish(
-                Events.CHAT_RECEIVED,
-                {"sender": f"[私聊] {sender}", "content": content, "time": t}
-            )
+            msg_id = msg.get("msg_id") or f"{sender}:{t}:{content}"
+            if sender == self.username:
+                return
+            if msg_id in self._seen_message_ids:
+                return
+            self._seen_message_ids.add(msg_id)
+            if len(self._seen_message_ids) > self._max_seen_messages:
+                self._seen_message_ids = set(list(self._seen_message_ids)[-self._max_seen_messages:])
+            if self.db.save_message(t, sender, content, msg_id, "private"):
+                self.event_bus.publish(
+                    Events.CHAT_RECEIVED,
+                    {"sender": f"[私聊] {sender}", "content": content, "time": t, "msg_id": msg_id}
+                )
 
         elif msg_type == MsgType.SYNC_REQ:
             last_id = int(msg.get("last_msg_id", 0))
@@ -129,7 +145,14 @@ class ChatManager:
             t = msg.get("time", time.time())
             sender = msg.get("sender", "?")
             content = msg.get("content", "")
-            msg_id = msg.get("msg_id", "")
+            msg_id = msg.get("msg_id") or f"{sender}:{t}:{content}"
+            if sender == self.username:
+                return
+            if msg_id in self._seen_message_ids:
+                return
+            self._seen_message_ids.add(msg_id)
+            if len(self._seen_message_ids) > self._max_seen_messages:
+                self._seen_message_ids = set(list(self._seen_message_ids)[-self._max_seen_messages:])
             self.db.save_message(t, sender, content, msg_id, "chat")
 
         elif msg_type == MsgType.SYNC_END:

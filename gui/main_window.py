@@ -2,6 +2,7 @@
 主窗口：四区域布局
 - 用户列表用 Treeview，显示 IP、昵称、延迟
 - 定时刷新延迟
+- 系统托盘 + 消息通知 + @提及高亮
 """
 import tkinter as tk
 from tkinter import ttk, scrolledtext, filedialog, simpledialog, messagebox
@@ -9,25 +10,38 @@ import queue
 import time
 from typing import Optional
 
+try:
+    import pystray
+except Exception:
+    pystray = None
+
+try:
+    from PIL import Image
+except Exception:
+    Image = None
+
 from core.event_bus import EventBus, Events
 
 
 class MainWindow:
     def __init__(self, event_bus: EventBus, control=None, config: Optional[dict] = None):
         self.event_bus = event_bus
-        self.control = control          # 用于查询延迟
+        self.control = control
         self.config = config or {}
         self.config_callback = None
+        self.current_username = str(self.config.get("username", "Anonymous")).strip() or "Anonymous"
+        self.is_minimized = False
+        self.tray_icon = None
+
+        # ===== 先创建 Tk 根窗口 =====
         self.root = tk.Tk()
         self.root.title("MajesticLink - 私人 P2P 联机")
         self.root.geometry("960x680")
         self.root.minsize(760, 520)
 
         self.ui_queue: queue.Queue = queue.Queue()
-        # ip -> treeview item id
         self._peer_items: dict[str, str] = {}
 
-        # 当前 PTT 热键（用于显示）
         self._current_ptt_key = str(self.config.get("ptt_key", "ctrl+shift+v")).strip() or "ctrl+shift+v"
         self.voice_mode = tk.StringVar()
 
@@ -35,12 +49,13 @@ class MainWindow:
         self._bind_events()
         self._apply_saved_voice_config()
 
-        # UI 队列轮询
         self.root.after(50, self._poll_ui_queue)
-        # 延迟刷新
         self.root.after(1000, self._refresh_latency)
 
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.protocol("WM_DELETE_WINDOW", self._minimize_to_tray)
+
+        # ===== 所有 Tk 组件就绪后再初始化托盘 =====
+        self._setup_tray()
 
     # ========== 布局 ==========
     def _build_layout(self):
@@ -53,7 +68,7 @@ class MainWindow:
         top_paned = ttk.PanedWindow(top_frame, orient=tk.HORIZONTAL)
         top_paned.pack(fill=tk.BOTH, expand=True)
 
-        # 用户列表（Treeview）
+        # 用户列表
         user_frame = ttk.LabelFrame(top_paned, text="在线用户")
         top_paned.add(user_frame, weight=1)
         self.user_tree = ttk.Treeview(
@@ -127,7 +142,6 @@ class MainWindow:
             command=self._on_mode_change
         ).pack(side=tk.LEFT, padx=3)
 
-        # 显示当前 PTT 热键（点击可修改）
         self.hotkey_label = ttk.Label(
             voice_frame,
             text="热键: Ctrl+Shift+V",
@@ -209,6 +223,96 @@ class MainWindow:
             pass
         self.root.after(50, self._poll_ui_queue)
 
+    def _schedule_ui(self, callback, *args, **kwargs):
+        """从非主线程安全地调度 UI 操作到主线程"""
+        try:
+            self.root.after(0, lambda: callback(*args, **kwargs))
+        except Exception:
+            try:
+                callback(*args, **kwargs)
+            except Exception:
+                pass
+
+    # ========== 系统托盘 ==========
+    def _setup_tray(self):
+        if pystray is None or Image is None:
+            return
+        try:
+            icon_image = Image.new("RGB", (64, 64), "#1E90FF")
+            self.tray_icon = pystray.Icon(
+                "MajesticLink",
+                icon_image,
+                "MajesticLink",
+                menu=pystray.Menu(
+                    pystray.MenuItem(
+                        "显示窗口",
+                        lambda: self._schedule_ui(self._restore_from_tray_impl),
+                    ),
+                    pystray.MenuItem(
+                        "加入语音/退出语音",
+                        lambda: self._schedule_ui(self._toggle_voice_from_tray_impl),
+                    ),
+                    pystray.MenuItem(
+                        "设置",
+                        lambda: self._schedule_ui(self._open_settings_dialog),
+                    ),
+                    pystray.MenuItem(
+                        "退出",
+                        lambda: self._schedule_ui(self._on_close),
+                    ),
+                ),
+            )
+            self.tray_icon.run_detached()
+        except Exception:
+            self.tray_icon = None
+
+    def _show_notification(self, title: str, message: str):
+        """通过托盘气泡发送通知（不阻塞）"""
+        if not self.is_minimized:
+            return
+        if self.tray_icon is not None:
+            try:
+                self.tray_icon.notify(message, title)
+                return
+            except Exception:
+                pass
+        # 兜底：控制台打印
+        print(f"[通知] {title}: {message}")
+
+    def _minimize_to_tray(self):
+        if self.tray_icon is not None:
+            self.is_minimized = True
+            self.root.withdraw()
+            return
+        self._on_close()
+
+    def _restore_from_tray_impl(self):
+        self.is_minimized = False
+        self.root.deiconify()
+        self.root.state("normal")
+        self.root.focus_force()
+
+    def _toggle_voice_from_tray_impl(self):
+        self.event_bus.publish("user_toggle_voice")
+
+    # ========== @提及检测 ==========
+    def _is_mention(self, content: str) -> bool:
+        if not content:
+            return False
+        mention = f"@{self.current_username}"
+        return mention.lower() in content.lower()
+
+    def _mention_span(self, content: str):
+        if not content:
+            return None
+        mention = f"@{self.current_username}"
+        lower = content.lower()
+        idx = lower.find(mention.lower())
+        if idx == -1:
+            return None
+        return idx, idx + len(mention)
+
+    # ========== UI 更新 ==========
     def _apply_ui_update(self, kind: str, data):
         if kind == "peer_joined":
             name = data.get("name", "?")
@@ -231,7 +335,12 @@ class MainWindow:
             content = data.get("content", "")
             t = data.get("time")
             time_str = time.strftime("%H:%M:%S", time.localtime(t)) if t else ""
-            self._append_chat(f"[{time_str}] [{sender}] {content}")
+            self._append_chat(
+                f"[{time_str}] [{sender}] {content}",
+                mention=self._is_mention(content),
+            )
+            if sender != self.current_username and self.is_minimized:
+                self._show_notification(f"消息来自 {sender}", content)
 
         elif kind == "chat_sent":
             content = data.get("content", "")
@@ -265,7 +374,6 @@ class MainWindow:
                 self.user_tree.item(item_id, values=(name, latency_str))
 
     def _refresh_latency(self):
-        """定时刷新延迟（从 control 查询）"""
         if self.control:
             try:
                 for ip, item_id in list(self._peer_items.items()):
@@ -278,9 +386,26 @@ class MainWindow:
                 pass
         self.root.after(1000, self._refresh_latency)
 
-    def _append_chat(self, text: str):
+    def _append_chat(self, text: str, mention: bool = False):
         self.chat_text.config(state=tk.NORMAL)
-        self.chat_text.insert(tk.END, text + "\n")
+        self.chat_text.tag_config(
+            "mention",
+            background="#fff2a8",
+            foreground="#7a2d00",
+            font=("Microsoft YaHei", 10, "bold"),
+        )
+        if mention:
+            span = self._mention_span(text)
+            if span is None:
+                self.chat_text.insert(tk.END, text)
+            else:
+                start, end = span
+                self.chat_text.insert(tk.END, text[:start])
+                self.chat_text.insert(tk.END, text[start:end], "mention")
+                self.chat_text.insert(tk.END, text[end:])
+        else:
+            self.chat_text.insert(tk.END, text)
+        self.chat_text.insert(tk.END, "\n")
         self.chat_text.see(tk.END)
         self.chat_text.config(state=tk.DISABLED)
 
@@ -293,8 +418,8 @@ class MainWindow:
                 values=(
                     room.get("name"),
                     room.get("host"),
-                    f"{room.get('ip')}:{room.get('port')}"
-                )
+                    f"{room.get('ip')}:{room.get('port')}",
+                ),
             )
 
     # ========== 文字 ==========
@@ -389,7 +514,7 @@ class MainWindow:
             frame,
             text="提示: 我的世界默认端口 25565\n泰拉瑞亚默认端口 7777",
             foreground="gray",
-            font=("Microsoft YaHei", 8)
+            font=("Microsoft YaHei", 8),
         ).grid(row=2, column=0, columnspan=2, pady=6)
 
         result = {"ok": False}
@@ -559,6 +684,7 @@ class MainWindow:
                 "已更新网络配置，EasyTier 连接参数会在下一次重启程序后生效。\n请重启 MajesticLink 后再继续使用。"
             )
 
+        self.current_username = str(self.config.get("username", "Anonymous")).strip() or "Anonymous"
         if self.config.get("username"):
             self.event_bus.publish(Events.SYSTEM_MESSAGE, {
                 "content": f"[设置] 已更新配置：昵称={self.config['username']}，网络={self.config.get('network_name')}"
@@ -578,7 +704,6 @@ class MainWindow:
         self.event_bus.publish("user_set_voice_mode", {"mode": mode})
 
     def _on_hotkey_click(self):
-        """点击热键标签时弹窗修改"""
         result = simpledialog.askstring(
             "修改 PTT 热键",
             "输入新热键（组合键用 + 连接，例如 ctrl+shift+v）:",
@@ -597,8 +722,17 @@ class MainWindow:
 
     # ========== 关闭 ==========
     def _on_close(self):
+        if self.tray_icon is not None:
+            try:
+                self.tray_icon.stop()
+            except Exception:
+                pass
+            self.tray_icon = None
         self.event_bus.publish(Events.APP_QUIT)
-        self.root.destroy()
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
 
     def run(self):
         self.root.mainloop()
