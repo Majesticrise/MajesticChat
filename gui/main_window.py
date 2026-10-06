@@ -272,7 +272,8 @@ class MainWindow:
             return
         if self.tray_icon is not None:
             try:
-                self.tray_icon.notify(message, title)
+                # pystray 的 notify 约定为 notify(title, message)
+                self.tray_icon.notify(message,title))
                 return
             except Exception:
                 pass
