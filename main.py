@@ -30,6 +30,10 @@ CONFIG_FILE_NAME = "MajesticLink.ini"
 CONFIG_SECTION = "App"
 
 
+def log(message: str):
+    print(f"[{time.strftime('%H:%M:%S')}] {message}", flush=True)
+
+
 def get_app_config_path() -> str:
     if getattr(sys, "frozen", False):
         base_dir = os.path.dirname(os.path.abspath(sys.executable))
@@ -66,7 +70,7 @@ def load_app_config() -> dict:
                 if value is not None:
                     result[key] = str(value).strip()
     except Exception as e:
-        print(f"[Config] 读取配置失败: {e}")
+        log(f"[Config] 读取配置失败: {e}")
     return result
 
 
@@ -86,9 +90,9 @@ def save_app_config(cfg: dict):
     try:
         with open(path, "w", encoding="utf-8") as f:
             parser.write(f)
-        print(f"[Config] 配置已保存到: {path}")
+        log(f"[Config] 配置已保存到: {path}")
     except Exception as e:
-        print(f"[Config] 保存配置失败: {e}")
+        log(f"[Config] 保存配置失败: {e}")
 
 
 def ask_config() -> dict:
@@ -99,7 +103,7 @@ def ask_config() -> dict:
     config_exists = os.path.exists(config_path) and os.path.getsize(config_path) > 0
 
     if config_exists:
-        print(f"[Config] 已从 {config_path} 读取配置")
+        log(f"[Config] 已从 {config_path} 读取配置")
         return saved_cfg
 
     has_stdin = False
@@ -163,20 +167,20 @@ def main():
     try:
         # ---- EasyTier ----
         if not easytier.start(cfg["network_name"], cfg["network_secret"]):
-            print("❌ EasyTier 启动失败")
+            log("❌ EasyTier 启动失败")
             return
 
         self_ip = None
         for i in range(15):
             self_ip = easytier.get_self_ip()
             if self_ip:
-                print(f"✅ 获取到虚拟 IP: {self_ip}")
+                log(f"✅ 获取到虚拟 IP: {self_ip}")
                 break
-            print(f"⏳ 等待虚拟 IP... ({i + 1}/15)")
+            log(f"⏳ 等待虚拟 IP... ({i + 1}/15)")
             time.sleep(3)
 
         if not self_ip:
-            print("❌ 无法获取虚拟 IP，退出")
+            log("❌ 无法获取虚拟 IP，退出")
             return
 
         # ---- 运行时 ----
@@ -184,7 +188,7 @@ def main():
         runtime = AsyncRuntime()
         runtime.start()
         if runtime.loop is None:
-            print("❌ AsyncRuntime 启动失败，退出")
+            log("❌ AsyncRuntime 启动失败，退出")
             return
 
         # ---- 组件 ----
@@ -232,7 +236,7 @@ def main():
                 return
             loop = runtime.loop
             if loop is None:
-                print("[Main] AsyncRuntime 未启动，跳过连接")
+                log("[Main] AsyncRuntime 未启动，跳过连接")
                 return
             asyncio.run_coroutine_threadsafe(
                 control.connect_to_peer(ip), loop
@@ -244,7 +248,7 @@ def main():
         def on_game_broadcast(data):
             loop = runtime.loop
             if loop is None:
-                print("[Main] AsyncRuntime 未启动，跳过广播")
+                log("[Main] AsyncRuntime 未启动，跳过广播")
                 return
             asyncio.run_coroutine_threadsafe(
                 control.broadcast(data), loop
@@ -260,9 +264,9 @@ def main():
                 try:
                     await coro
                     started.append(name)
-                    print(f"[Main] {name} 已启动")
+                    log(f"[Main] {name} 已启动")
                 except Exception as e:
-                    print(f"[Main] {name} 启动失败: {e}")
+                    log(f"[Main] {name} 启动失败: {e}")
                     traceback.print_exc()
 
             await safe_start("ControlServer", control.start_server())
@@ -272,10 +276,10 @@ def main():
             await safe_start("VoiceManager", voice_mgr.start())
 
             if len(started) < 5:
-                print(f"[Main] 启动完成度: {len(started)}/5，部分模块未就绪")
+                log(f"[Main] 启动完成度: {len(started)}/5，部分模块未就绪")
             else:
                 asyncio.create_task(discovery.start())
-                print("[Main] 系统就绪")
+                log("[Main] 系统就绪")
 
         loop = runtime.loop
         if loop is None:
@@ -301,20 +305,20 @@ def main():
                             Events.PEER_JOINED,
                             {"ip": ip, "name": conn.username}
                         )
-                        print(f"[Main] 补发 PEER_JOINED: {conn.username} ({ip})")
+                        log(f"[Main] 补发 PEER_JOINED: {conn.username} ({ip})")
             except Exception as e:
-                print(f"[Main] 补发用户事件失败: {e}")
+                log(f"[Main] 补发用户事件失败: {e}")
 
         threading.Thread(target=_republish_connected_peers, daemon=True).start()
 
         window.run()
 
     except Exception as e:
-        print(f"运行异常: {e}")
+        log(f"运行异常: {e}")
         traceback.print_exc()
 
     finally:
-        print("[Main] 正在清理资源...")
+        log("[Main] 正在清理资源...")
 
         # 停止全局热键
         try:
@@ -350,24 +354,40 @@ def main():
         except Exception:
             pass
 
-        print("[Main] 已退出")
+        log("[Main] 已退出")
 
 
 if __name__ == "__main__":
-    if sys.stdout is None:
-        sys.stdout = open(os.devnull, "w", encoding="utf-8")
-    if sys.stderr is None:
-        sys.stderr = open(os.devnull, "w", encoding="utf-8")
+    log_file = None
+    if sys.stdout is None or sys.stderr is None:
+        log_dir = os.path.dirname(
+            os.path.abspath(
+                sys.executable if getattr(sys, "frozen", False) else __file__
+            )
+        )
+        log_path = os.path.join(log_dir, "run.log")
+        try:
+            log_file = open(log_path, "a", encoding="utf-8", buffering=1)
+            sys.stdout = log_file
+            sys.stderr = log_file
+        except Exception:
+            devnull = open(os.devnull, "w", encoding="utf-8")
+            sys.stdout = devnull
+            sys.stderr = devnull
 
     try:
         main()
     except SystemExit:
         raise
     except Exception as e:
-        print(f"启动失败: {e}")
+        log(f"启动失败: {e}")
         traceback.print_exc()
         try:
             import tkinter.messagebox as mb
-            mb.showerror("MajesticLink 启动失败", f"{e}\n\n详细日志见 error.log")
+            mb.showerror("MajesticLink 启动失败", f"{e}\n\n详细日志见 run.log")
         except Exception:
             pass
+    finally:
+        if log_file is not None and not log_file.closed:
+            log_file.flush()
+            log_file.close()
