@@ -9,6 +9,7 @@ from tkinter import ttk, scrolledtext, filedialog, simpledialog, messagebox
 import queue
 import time
 from typing import Optional
+import os
 
 try:
     import pystray
@@ -20,6 +21,7 @@ try:
 except Exception:
     Image = None
 
+from core.config import RECEIVED_FILES_DIR
 from core.event_bus import EventBus, Events
 
 
@@ -32,6 +34,9 @@ class MainWindow:
         self.current_username = str(self.config.get("username", "Anonymous")).strip() or "Anonymous"
         self.is_minimized = False
         self.tray_icon = None
+        self.reply_target = None
+        self._chat_entries: list[dict] = []
+        self._peer_volumes: dict[str, float] = {}
 
         # ===== 先创建 Tk 根窗口 =====
         self.root = tk.Tk()
@@ -84,6 +89,7 @@ class MainWindow:
         self.user_tree.column("name", width=80, anchor="w")
         self.user_tree.column("latency", width=60, anchor="e")
         self.user_tree.pack(fill=tk.BOTH, expand=True, padx=3, pady=3)
+        self.user_tree.bind("<Button-3>", self._on_user_context_menu)
 
         # 聊天记录
         chat_frame = ttk.LabelFrame(top_paned, text="聊天记录")
@@ -92,6 +98,7 @@ class MainWindow:
             chat_frame, wrap=tk.WORD, state=tk.DISABLED, font=("Microsoft YaHei", 10)
         )
         self.chat_text.pack(fill=tk.BOTH, expand=True, padx=3, pady=3)
+        self.chat_text.bind("<Double-Button-1>", self._on_chat_double_click)
 
         # 下方
         bottom_frame = ttk.Frame(main_paned)
@@ -164,14 +171,22 @@ class MainWindow:
         )
         self.voice_btn.pack(side=tk.RIGHT, padx=3)
 
+        reply_bar = ttk.Frame(bottom_frame)
+        reply_bar.pack(fill=tk.X, padx=3, pady=(0, 3))
+        self.reply_label = ttk.Label(reply_bar, text="回复: 无", foreground="#666666", anchor=tk.W)
+        self.reply_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(reply_bar, text="清除", command=self._clear_reply_target).pack(side=tk.RIGHT, padx=(5, 0))
+
         # 输入框行
         input_frame = ttk.Frame(bottom_frame)
         input_frame.pack(fill=tk.X, padx=3, pady=(0, 5))
         self.input_entry = ttk.Entry(input_frame)
         self.input_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
         self.input_entry.bind("<Return>", lambda e: self._on_send())
+        self.input_entry.bind("<Control-v>", self._on_paste_image)
 
         ttk.Button(input_frame, text="📎 发送文件", command=self._on_send_file).pack(side=tk.RIGHT, padx=(5, 0))
+        ttk.Button(input_frame, text="回复", command=self._reply_to_last_message).pack(side=tk.RIGHT, padx=(5, 0))
         ttk.Button(input_frame, text="发送", command=self._on_send).pack(side=tk.RIGHT)
 
     # ========== 事件订阅 ==========
@@ -272,8 +287,7 @@ class MainWindow:
             return
         if self.tray_icon is not None:
             try:
-                # pystray 的 notify 约定为 notify(title, message)
-                self.tray_icon.notify(message,title))
+                self.tray_icon.notify(message, title)#我查过了，文档就是这么写的，不用改了
                 return
             except Exception:
                 pass
@@ -295,6 +309,99 @@ class MainWindow:
 
     def _toggle_voice_from_tray_impl(self):
         self.event_bus.publish("user_toggle_voice")
+
+    @staticmethod
+    def _format_reply_preview(sender: str, content: str) -> str:
+        text = str(content or "").replace("\n", " ").strip()
+        if len(text) > 60:
+            text = text[:57] + "..."
+        return f"回复 {sender}: {text}"
+
+    def _set_reply_target(self, sender: str, content: str, msg_id: str | None = None):
+        self.reply_target = {"sender": sender, "content": content, "msg_id": msg_id}
+        preview = self._format_reply_preview(sender, content)
+        self.reply_label.config(text=f"回复: {preview}")
+
+    def _clear_reply_target(self):
+        self.reply_target = None
+        self.reply_label.config(text="回复: 无")
+
+    def _reply_to_last_message(self):
+        if not self._chat_entries:
+            return
+        entry = self._chat_entries[-1]
+        sender = entry.get("sender")
+        content = entry.get("content")
+        if sender and content:
+            self._set_reply_target(sender, content, entry.get("msg_id"))
+
+    def _on_chat_double_click(self, event):
+        try:
+            index = self.chat_text.index(f"@{event.x},{event.y}")
+        except Exception:
+            return
+        line_no = int(str(index).split(".")[0])
+        if line_no <= 0 or not self._chat_entries:
+            return
+        idx = max(0, line_no - 1)
+        if idx >= len(self._chat_entries):
+            idx = len(self._chat_entries) - 1
+        entry = self._chat_entries[idx]
+        sender = entry.get("sender")
+        content = entry.get("content")
+        if sender and content:
+            self._set_reply_target(sender, content, entry.get("msg_id"))
+
+    def _on_user_context_menu(self, event):
+        item = self.user_tree.identify_row(event.y)
+        if not item:
+            return
+        self.user_tree.selection_set(item)
+        ip = self.user_tree.item(item, "text")
+        name = self.user_tree.item(item, "values")[0] if self.user_tree.item(item, "values") else ip
+        menu = tk.Menu(self.root, tearoff=False)
+        for label, value in [
+            ("静音", 0.0),
+            ("20%", 0.2),
+            ("50%", 0.5),
+            ("80%", 0.8),
+            ("100%", 1.0),
+            ("150%", 1.5),
+            ("200%", 2.0),
+        ]:
+            menu.add_command(label=f"{name}: {label}", command=lambda v=value, peer_ip=ip: self._set_peer_volume(peer_ip, v))
+        menu.post(event.x_root, event.y_root)
+
+    def _set_peer_volume(self, ip: str, volume: float):
+        self._peer_volumes[ip] = float(volume)
+        self.event_bus.publish("user_set_peer_volume", {"ip": ip, "volume": float(volume)})
+
+    def _on_paste_image(self, event=None):
+        try:
+            from PIL import ImageGrab
+            image = ImageGrab.grabclipboard()
+        except Exception:
+            image = None
+
+        if image is None:
+            # 剪贴板不是图片 → 让 Tk 执行默认粘贴行为
+            return None
+
+        target = self._pick_target_user()
+        if not target:
+            return "break"
+
+        os.makedirs(RECEIVED_FILES_DIR, exist_ok=True)
+        out_path = os.path.join(
+            RECEIVED_FILES_DIR,
+            f"clipboard_{int(time.time() * 1000)}.png",
+        )
+        image.save(out_path)
+        self.event_bus.publish("user_send_file", {
+            "target_name": target, "file_path": out_path,
+        })
+        self._append_chat(f"[系统] 已发送剪贴板图片到 {target}")
+        return "break"   # 只在成功发送图片时拦截
 
     # ========== @提及检测 ==========
     def _is_mention(self, content: str) -> bool:
@@ -324,6 +431,7 @@ class MainWindow:
                 "", tk.END, text=ip, values=(name, "测量中...")
             )
             self._peer_items[ip] = item_id
+            self._peer_volumes.setdefault(ip, 1.0)
 
         elif kind == "peer_left":
             ip = data.get("ip", "")
@@ -339,15 +447,24 @@ class MainWindow:
             self._append_chat(
                 f"[{time_str}] [{sender}] {content}",
                 mention=self._is_mention(content),
+                sender=sender,
+                content=data.get("content", ""),
+                msg_id=data.get("msg_id"),
             )
             if sender != self.current_username and self.is_minimized:
-                self._show_notification(f"消息来自 {sender}", content)
+                self._show_notification(f"消息来自 {sender}", str(content).split("\n", 1)[0])
 
         elif kind == "chat_sent":
             content = data.get("content", "")
+            reply_to = data.get("reply_to")
+            reply_to_text = data.get("reply_to_text")
             t = data.get("time")
             time_str = time.strftime("%H:%M:%S", time.localtime(t)) if t else ""
-            self._append_chat(f"[{time_str}] [我] {content}")
+            display = content
+            if reply_to:
+                display = self._format_reply_preview(reply_to, reply_to_text) + "\n" + content
+            self._append_chat(f"[{time_str}] [我] {display}", sender=self.current_username, content=content)
+            self._clear_reply_target()
 
         elif kind == "system_message":
             self._append_chat(f"[系统] {data.get('content', '')}")
@@ -387,7 +504,7 @@ class MainWindow:
                 pass
         self.root.after(1000, self._refresh_latency)
 
-    def _append_chat(self, text: str, mention: bool = False):
+    def _append_chat(self, text: str, mention: bool = False, sender: Optional[str] = None, content: Optional[str] = None, msg_id: Optional[str] = None):
         self.chat_text.config(state=tk.NORMAL)
         self.chat_text.tag_config(
             "mention",
@@ -407,6 +524,9 @@ class MainWindow:
         else:
             self.chat_text.insert(tk.END, text)
         self.chat_text.insert(tk.END, "\n")
+        self._chat_entries.append({"sender": sender, "content": content or text, "msg_id": msg_id})
+        if len(self._chat_entries) > 200:
+            self._chat_entries = self._chat_entries[-200:]
         self.chat_text.see(tk.END)
         self.chat_text.config(state=tk.DISABLED)
 
@@ -428,8 +548,18 @@ class MainWindow:
         text = self.input_entry.get().strip()
         if not text:
             return
+        payload = {"content": text}
+        if self.reply_target is not None:
+            sender = self.reply_target.get("sender")
+            content = self.reply_target.get("content")
+            if sender is not None:
+                payload["reply_to"] = str(sender)
+            if content is not None:
+                payload["reply_to_text"] = str(content)
         self.input_entry.delete(0, tk.END)
-        self.event_bus.publish("user_send_message", {"content": text})
+        self.event_bus.publish("user_send_message", payload)
+        if self.reply_target is not None:
+            self._clear_reply_target()
 
     # ========== 发送文件 ==========
     def _on_send_file(self):

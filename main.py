@@ -15,6 +15,7 @@ from core.event_bus import EventBus, Events
 from features.chat_manager import ChatManager
 from features.file_manager import FileManager
 from features.game_manager import GameManager
+from features.hotkey_manager import HotkeyManager
 from features.voice_manager import VoiceManager
 from gui.main_window import MainWindow
 from network.control_channel import ControlChannel
@@ -156,6 +157,7 @@ def main():
     runtime = None
     control = None
     voice_mgr = None
+    hotkey_mgr = None
     window = None
 
     try:
@@ -195,6 +197,23 @@ def main():
         file_mgr = FileManager(cfg["username"], control, event_bus, runtime)
         game_mgr = GameManager(cfg["username"], self_ip, control, event_bus)
         voice_mgr = VoiceManager(cfg["username"], self_ip, control, runtime, event_bus)
+        hotkey_mgr = HotkeyManager(event_bus)
+
+        # ---- 全局热键 ----
+        if hotkey_mgr.start():
+            initial_ptt_key = str(cfg.get("ptt_key", "ctrl+shift+v")).strip() or "ctrl+shift+v"
+            hotkey_mgr.register_ptt(initial_ptt_key)
+
+            # 用户在 GUI 中修改热键时，动态重新注册
+            def on_user_set_ptt_key(data):
+                if not isinstance(data, dict):
+                    return
+                new_key = str(data.get("key", "")).strip()
+                if not new_key:
+                    return
+                hotkey_mgr.register_ptt(new_key)
+
+            event_bus.subscribe("user_set_ptt_key", on_user_set_ptt_key)
 
         # 底层发现新节点 → 主动连接（只有 IP 小的一方发起，避免连接对冲）
         def _ip_less(a: str, b: str) -> bool:
@@ -233,7 +252,7 @@ def main():
 
         event_bus.subscribe("game_broadcast_rooms", on_game_broadcast)
 
-        # ---- 异步初始化（每个模块独立异常隔离，避免一个崩溃拖垮全部）----
+        # ---- 异步初始化 ----
         async def async_setup():
             started = []
 
@@ -269,13 +288,12 @@ def main():
             {"content": f"已上线 · 昵称: {cfg['username']} · IP: {self_ip}"}
         )
 
-        # 把 control 传给 GUI，用于查询延迟，并让 GUI 与配置文件保持同步
         window = MainWindow(event_bus, control=control, config=cfg)
         window.config_callback = lambda new_cfg: save_app_config(new_cfg)
 
         # ===== GUI 创建后，补发已连接用户事件（防止时序错过）=====
         def _republish_connected_peers():
-            time.sleep(2.0)   # 等 GUI 完全就绪
+            time.sleep(2.0)
             try:
                 for ip, conn in list(control.connections.items()):
                     if conn.handshake_done and conn.username:
@@ -297,6 +315,14 @@ def main():
 
     finally:
         print("[Main] 正在清理资源...")
+
+        # 停止全局热键
+        try:
+            if hotkey_mgr:
+                hotkey_mgr.stop()
+        except Exception:
+            pass
+
         try:
             if voice_mgr and runtime and runtime.loop:
                 asyncio.run_coroutine_threadsafe(

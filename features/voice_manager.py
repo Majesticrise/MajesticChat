@@ -54,12 +54,17 @@ class VoiceManager:
         self._mix_task = None
         self.ptt_key = "ctrl+shift+v"
 
+        # sender_id -> peer_ip / peer volumes
+        self.sender_ip_map: dict[int, str] = {}
+        self.peer_volumes: dict[str, float] = {}
+
     async def start(self):
         self.event_bus.subscribe("control_message", self._on_control_message)
         self.event_bus.subscribe("user_toggle_voice", self._on_toggle_voice)
         self.event_bus.subscribe("user_set_volume", self._on_set_volume)
         self.event_bus.subscribe("user_set_voice_mode", self._on_set_mode)
         self.event_bus.subscribe("user_set_ptt_key", self._on_set_ptt_key)
+        self.event_bus.subscribe("user_set_peer_volume", self._on_set_peer_volume)
         self.event_bus.subscribe("user_ptt_press", self._on_ptt_press)
         self.event_bus.subscribe("user_ptt_release", self._on_ptt_release)
         await self.voice_channel.start()
@@ -183,6 +188,9 @@ class VoiceManager:
             peer_ip = msg.get("ip", "")
             if peer_ip and peer_ip != self.self_ip:
                 self.voice_channel.add_peer(peer_ip)
+                sender_id = hash(peer_ip) & 0xFFFFFFFF
+                self.sender_ip_map[sender_id] = peer_ip
+                self.mixer.set_gain(sender_id, self.peer_volumes.get(peer_ip, 1.0))
                 self.event_bus.publish(Events.VOICE_PEER_JOINED, {"ip": peer_ip})
 
             # 如果自己已经在语音，回复告知对方
@@ -193,6 +201,9 @@ class VoiceManager:
         elif msg_type == MsgType.VOICE_LEAVE:
             peer_ip = msg.get("ip", "")
             self.voice_channel.remove_peer(peer_ip)
+            sender_id = hash(peer_ip) & 0xFFFFFFFF
+            self.sender_ip_map.pop(sender_id, None)
+            self.mixer.remove(sender_id)
             self.event_bus.publish(Events.VOICE_PEER_LEFT, {"ip": peer_ip})
 
     async def _send_voice_state_to(self, ip: str):
@@ -201,6 +212,17 @@ class VoiceManager:
             "username": self.username,
             "ip": self.self_ip,
         })
+
+    def _on_set_peer_volume(self, data: Mapping[str, Any] | None):
+        if data is None:
+            return
+        ip = data.get("ip")
+        if not ip:
+            return
+        volume = float(data.get("volume", 1.0))
+        self.peer_volumes[ip] = max(0.0, min(3.0, volume))
+        sender_id = hash(ip) & 0xFFFFFFFF
+        self.mixer.set_gain(sender_id, self.peer_volumes[ip])
 
     def _on_set_volume(self, data: Mapping[str, Any] | None):
         if data is None:

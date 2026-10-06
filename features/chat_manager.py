@@ -25,6 +25,13 @@ class ChatManager:
         self._seen_message_ids: set[str] = set()
         self._max_seen_messages = 4096
 
+    @staticmethod
+    def _format_reply_text(sender: str, reply_text: str) -> str:
+        text = str(reply_text or "").replace("\n", " ").strip()
+        if len(text) > 60:
+            text = text[:57] + "..."
+        return f"↩ 回复 {sender}: {text}"
+
     async def start(self):
         self.event_bus.subscribe("user_send_message", self._on_user_send)
         self.event_bus.subscribe("control_message", self._on_control_message)
@@ -37,7 +44,9 @@ class ChatManager:
         if content.startswith("/"):
             self._handle_command(content)
             return
-        self.runtime.submit(self._do_send(content))
+        reply_to = data.get("reply_to")
+        reply_to_text = data.get("reply_to_text")
+        self.runtime.submit(self._do_send(content, reply_to=reply_to, reply_to_text=reply_to_text))
 
     def _handle_command(self, content: str):
         parts = content.split()
@@ -85,14 +94,23 @@ class ChatManager:
 
         self._sys_msg(f"未知命令: {head}")
 
-    async def _do_send(self, content: str):
+    async def _do_send(self, content: str, reply_to: str | None = None, reply_to_text: str | None = None):
         t = time.time()
         self.msg_counter += 1
         msg_id = f"{self.username}_{int(t * 1000)}_{self.msg_counter}"
         payload = make_chat(self.username, content, t, msg_id)
+        if reply_to:
+            payload["reply_to"] = str(reply_to)
+            if reply_to_text is not None:
+                payload["reply_to_text"] = str(reply_to_text)
         self.db.save_message(t, self.username, content, msg_id, "chat")
         await self.control.broadcast(payload)
-        self.event_bus.publish(Events.CHAT_SENT, {"content": content, "time": t})
+        self.event_bus.publish(Events.CHAT_SENT, {
+            "content": content,
+            "time": t,
+            "reply_to": reply_to,
+            "reply_to_text": reply_to_text,
+        })
 
     # ========== 网络收到 ==========
     def _on_control_message(self, data: Mapping[str, Any]):
@@ -105,6 +123,8 @@ class ChatManager:
             content = msg.get("content", "")
             t = msg.get("time", time.time())
             msg_id = msg.get("msg_id") or f"{sender}:{t}:{content}"
+            reply_to = msg.get("reply_to")
+            reply_to_text = msg.get("reply_to_text")
             if sender == self.username:
                 return
             if msg_id in self._seen_message_ids:
@@ -113,9 +133,13 @@ class ChatManager:
             if len(self._seen_message_ids) > self._max_seen_messages:
                 self._seen_message_ids = set(list(self._seen_message_ids)[-self._max_seen_messages:])
             if self.db.save_message(t, sender, content, msg_id, "chat"):
+                display_content = content
+                if reply_to:
+                    display_content = self._format_reply_text(reply_to, reply_to_text) + "\n" + content
                 self.event_bus.publish(
                     Events.CHAT_RECEIVED,
-                    {"sender": sender, "content": content, "time": t, "msg_id": msg_id}
+                    {"sender": sender, "content": display_content, "time": t, "msg_id": msg_id,
+                     "reply_to": reply_to, "reply_to_text": reply_to_text}
                 )
 
         elif msg_type == MsgType.PRIVATE:
@@ -123,6 +147,8 @@ class ChatManager:
             content = msg.get("content", "")
             t = msg.get("time", time.time())
             msg_id = msg.get("msg_id") or f"{sender}:{t}:{content}"
+            reply_to = msg.get("reply_to")
+            reply_to_text = msg.get("reply_to_text")
             if sender == self.username:
                 return
             if msg_id in self._seen_message_ids:
@@ -131,9 +157,13 @@ class ChatManager:
             if len(self._seen_message_ids) > self._max_seen_messages:
                 self._seen_message_ids = set(list(self._seen_message_ids)[-self._max_seen_messages:])
             if self.db.save_message(t, sender, content, msg_id, "private"):
+                display_content = content
+                if reply_to:
+                    display_content = self._format_reply_text(reply_to, reply_to_text) + "\n" + content
                 self.event_bus.publish(
                     Events.CHAT_RECEIVED,
-                    {"sender": f"[私聊] {sender}", "content": content, "time": t, "msg_id": msg_id}
+                    {"sender": f"[私聊] {sender}", "content": display_content, "time": t, "msg_id": msg_id,
+                     "reply_to": reply_to, "reply_to_text": reply_to_text}
                 )
 
         elif msg_type == MsgType.SYNC_REQ:

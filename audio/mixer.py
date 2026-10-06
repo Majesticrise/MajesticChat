@@ -11,6 +11,17 @@ class Mixer:
     def __init__(self):
         # sender_id -> 最近的 PCM
         self.frames: Dict[int, np.ndarray] = {}
+        # sender_id -> 增益倍数（0.0 ~ 2.0）
+        self.gains: Dict[int, float] = {}
+
+    def set_gain(self, sender_id: int, gain: float):
+        try:
+            gain_value = float(gain)
+        except Exception:
+            return
+        if gain_value < 0:
+            gain_value = 0.0
+        self.gains[sender_id] = max(0.0, min(3.0, gain_value))
 
     def add(self, sender_id: int, pcm_bytes: bytes):
         try:
@@ -23,20 +34,21 @@ class Mixer:
 
     def remove(self, sender_id: int):
         self.frames.pop(sender_id, None)
+        self.gains.pop(sender_id, None)
 
     def mix(self) -> bytes:
         """混合当前所有帧，返回 int16 bytes"""
         if not self.frames:
             return b"\x00" * (FRAME_SIZE * 2)
 
-        # 叠加
-        acc = np.zeros(FRAME_SIZE, dtype=np.int32)
-        for pcm in self.frames.values():
-            acc += pcm.astype(np.int32)
+        acc = np.zeros(FRAME_SIZE, dtype=np.float64)
+        for sender_id, pcm in self.frames.items():
+            gain = self.gains.get(sender_id, 1.0)
+            acc += pcm.astype(np.float64) * gain
 
-        # clip 到 int16 范围
         acc = np.clip(acc, -32768, 32767).astype(np.int16)
         return acc.tobytes()
 
     def clear(self):
         self.frames.clear()
+        self.gains.clear()
