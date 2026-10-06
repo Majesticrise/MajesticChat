@@ -3,7 +3,7 @@
 """
 import threading
 from typing import Any, Optional
-
+import keyboard
 from core.event_bus import EventBus
 
 
@@ -20,7 +20,6 @@ class HotkeyManager:
         if self._keyboard is not None:
             return True
         try:
-            import keyboard
             self._keyboard = keyboard
             print("[Hotkey] 管理器已启动")
             return True
